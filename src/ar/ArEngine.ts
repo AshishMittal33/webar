@@ -107,6 +107,11 @@ interface Target {
   source: ReticleSource;
   /** Present only for real hit-test results (lets us anchor to the plane). */
   hit: XRHitTestResult | null;
+  /**
+   * The raw hit pose as a matrix. An anchor created from the hit result
+   * takes exactly this pose, so object offsets must be expressed against it.
+   */
+  hitMatrix: THREE.Matrix4 | null;
 }
 
 /** A wall defined by the user: a point on its base line, its direction, and its normal. */
@@ -436,6 +441,7 @@ export class ArEngine {
           surface: classifyNormal(normal),
           source: 'hit',
           hit: results[0],
+          hitMatrix: new THREE.Matrix4().fromArray(pose.transform.matrix),
         };
       }
     }
@@ -579,7 +585,7 @@ export class ArEngine {
       if (normal.lengthSq() < 1e-4) return null;
       normal.normalize();
     }
-    return { position: center, normal, surface: 'vertical', source: 'depth', hit: null };
+    return { position: center, normal, surface: 'vertical', source: 'depth', hit: null, hitMatrix: null };
   }
 
   /**
@@ -598,6 +604,7 @@ export class ArEngine {
       prev.position.lerp(next.position, RETICLE_SMOOTHING);
       prev.normal.lerp(next.normal, RETICLE_SMOOTHING).normalize();
       prev.hit = next.hit;
+      prev.hitMatrix = next.hitMatrix;
       return prev;
     }
     return next;
@@ -654,9 +661,12 @@ export class ArEngine {
     if (!this.isPlaceable(this.reticleState)) return;
 
     if (this.mode === 'floor') {
+      // The cube's origin is its bottom centre, so the raw hit pose (+Y up
+      // off the floor) is exactly the pose we want; no offset is needed.
       const root = new THREE.Group();
       root.matrixAutoUpdate = false;
-      root.matrix.compose(target.position, quatWithUpAxis(target.normal), ONE);
+      if (target.hitMatrix) root.matrix.copy(target.hitMatrix);
+      else root.matrix.compose(target.position, quatWithUpAxis(target.normal), ONE);
       root.add(createCube());
       const obj: PlacedObject = { root, anchor: null, kind: 'cube', wallMethod: null };
       this.addPlaced(obj);
@@ -693,8 +703,10 @@ export class ArEngine {
     this.lastWallMethod = method;
     this.addPlaced(obj);
 
-    if (method === 'wall-hit') {
-      this.anchorToHit(target.hit, obj, { position, quat });
+    if (method === 'wall-hit' && target.hitMatrix) {
+      // The anchor will take the hit pose (+Y = wall normal), not the TV
+      // pose (+Z = wall normal), so the TV is parented with the offset.
+      this.anchorToHit(target.hit, obj, { hitMatrix: target.hitMatrix, position, quat });
     } else {
       this.anchorToPose(frame, refSpace, obj, position, quat);
     }
@@ -797,20 +809,24 @@ export class ArEngine {
   private anchorToHit(
     hit: XRHitTestResult | null,
     obj: PlacedObject,
-    desired?: { position: THREE.Vector3; quat: THREE.Quaternion },
+    desired?: { hitMatrix: THREE.Matrix4; position: THREE.Vector3; quat: THREE.Quaternion },
   ) {
     const anchorable = hit as AnchorCapableHit | null;
     if (!this.anchorsAvailable || !anchorable || typeof anchorable.createAnchor !== 'function') return;
 
     if (desired) {
-      const hitPose = new THREE.Matrix4().copy(obj.root.matrix);
+      // root will follow the anchor, whose pose is the HIT pose. Put the
+      // model under an inner group carrying hitPose^-1 * desiredPose so the
+      // world result is the desired pose, and start root at the hit pose so
+      // nothing moves when the anchor resolves.
       const desiredM = new THREE.Matrix4().compose(desired.position, desired.quat, ONE);
-      const offset = new THREE.Matrix4().copy(hitPose).invert().multiply(desiredM);
+      const offset = new THREE.Matrix4().copy(desired.hitMatrix).invert().multiply(desiredM);
       const inner = new THREE.Group();
       inner.matrixAutoUpdate = false;
       inner.matrix.copy(offset);
       for (const child of [...obj.root.children]) inner.add(child);
       obj.root.add(inner);
+      obj.root.matrix.copy(desired.hitMatrix);
     }
 
     anchorable
