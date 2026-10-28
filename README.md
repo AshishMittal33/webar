@@ -9,8 +9,8 @@ app, no paid SDKs, no backend.
 | Phase | Goal | State |
 | ----- | ---- | ----- |
 | 1 | React + TypeScript + Vite + Three.js project, landing screen, WebXR support check | Done |
-| 2 | Real immersive-ar session starts on an Android device | Next |
-| 3 | Hit-testing, place a single cube on the floor | Pending |
+| 2 | Real immersive-ar session starts on an Android device | Built, awaiting phone test |
+| 3 | Hit-testing, place a single cube on the floor | Next |
 | 4 | Vertical wall placement investigation, single TV model | Pending |
 | 5 | Multi-object manager and touch manipulation | Pending |
 | 6 | Catalogue, error handling, performance, JSON export/import | Pending |
@@ -58,12 +58,22 @@ src/
   App.tsx             Screen switching (landing / AR)
   ar/
     support.ts        WebXR capability detection (no session started)
+    types.ts          Tracking state, session info, error mapping
+    ArEngine.ts       WebXR session + Three.js renderer + render loop
   components/
     Landing.tsx       Start screen, device check, instructions
+    ArOverlay.tsx     In-session UI (dom-overlay): status, details, Exit
   styles/global.css   Mobile-first styles
 public/models/        GLB assets (added in later phases)
-docs/                 Testing checklist, troubleshooting, deployment (later)
+docs/
+  android-testing-checklist.md
+  troubleshooting.md
 ```
+
+## UI preview without a phone
+
+Open the site with `?ui=preview` to see the in-session overlay UI on a
+desktop. It is clearly labelled and starts no AR session.
 
 ## Honest limitations
 

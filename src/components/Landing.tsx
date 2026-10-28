@@ -1,11 +1,14 @@
 import { useEffect, useState } from 'react';
 import { checkWebXrSupport, type SupportReport } from '../ar/support';
+import type { ArError } from '../ar/types';
 
 interface LandingProps {
   onStart: () => void;
+  /** Message from a previous attempt (permission denied, session ended...). */
+  notice?: ArError | null;
 }
 
-export default function Landing({ onStart }: LandingProps) {
+export default function Landing({ onStart, notice }: LandingProps) {
   const [report, setReport] = useState<SupportReport | null>(null);
   const [showDiag, setShowDiag] = useState(false);
 
@@ -30,6 +33,13 @@ export default function Landing({ onStart }: LandingProps) {
           Place TVs, tables and furniture in your real room using your phone camera.
         </p>
       </div>
+
+      {notice && (
+        <section className="card notice">
+          <strong>{notice.message}</strong>
+          <p className="hint">{notice.hint}</p>
+        </section>
+      )}
 
       <section className="card">
         <div className="status-row">
