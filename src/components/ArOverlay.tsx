@@ -36,8 +36,10 @@ const WALL_METHOD_LABEL: Record<WallMethod, string> = {
 
 function guidance(mode: PlacementMode, tracking: TrackingState, r: ReticleState, hitTest: boolean): string {
   if (tracking === 'initializing') return 'Move your phone slowly to scan the area.';
-  if (tracking === 'lost') return 'Tracking lost. Move your phone slowly and improve the lighting.';
-  if (tracking === 'limited') return 'Tracking is limited. Move slowly and point the camera at textured surfaces.';
+  if (tracking === 'lost')
+    return 'Tracking lost. Step back from plain surfaces, point at furniture or the floor, and move slowly.';
+  if (tracking === 'limited')
+    return 'Tracking is limited, usually from being too close to a plain wall. Step back a little and move slowly.';
   if (!hitTest) return 'This device did not grant hit-testing, so surfaces cannot be detected.';
 
   if (mode === 'floor') {
@@ -51,7 +53,7 @@ function guidance(mode: PlacementMode, tracking: TrackingState, r: ReticleState,
   if (!r.visible) return 'Aim at the wall to position a TV. If nothing appears, aim at the bottom of the wall where it meets the floor.';
   if (r.surface === 'vertical' && r.source === 'hit') return 'Wall detected. Tap the screen or press Place to mount the TV.';
   if (r.surface === 'vertical' && r.source === 'depth')
-    return 'Wall estimated from depth (automatic wall detection not available here). Place, then adjust.';
+    return 'Wall estimated from depth. Hold still for a second, then press Place.';
   if (r.surface === 'horizontal')
     return 'No wall detected. Manual mode: aim at the line where the wall meets the floor and press Place. The TV is mounted 1.2 m above that point.';
   return 'Aim at a flat wall.';

@@ -11,10 +11,10 @@ import * as THREE from 'three';
 
 export const CUBE_SIZE = 0.15;
 
-/** Sample TV: 55 inch class, about 1.22 m wide, 0.70 m tall, 5 cm deep. */
-export const TV_WIDTH = 1.22;
-export const TV_HEIGHT = 0.7;
-export const TV_DEPTH = 0.05;
+/** Sample TV: 43 inch class, about 0.96 m wide, 0.56 m tall, 4 cm deep. */
+export const TV_WIDTH = 0.96;
+export const TV_HEIGHT = 0.56;
+export const TV_DEPTH = 0.04;
 
 const shared = {
   cubeGeometry: new THREE.BoxGeometry(CUBE_SIZE, CUBE_SIZE, CUBE_SIZE),
