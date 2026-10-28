@@ -343,3 +343,29 @@ ul.steps {
   background: rgba(11, 15, 25, 0.75);
   font-weight: 600;
 }
+
+/* ---------- Placement mode switch ---------- */
+
+.ar-mode {
+  display: flex;
+  width: 100%;
+  max-width: 420px;
+  background: rgba(11, 15, 25, 0.75);
+  border-radius: var(--radius);
+  padding: 4px;
+  gap: 4px;
+}
+
+.ar-mode button {
+  flex: 1;
+  min-height: 44px;
+  background: transparent;
+  color: var(--muted);
+  font-weight: 600;
+  border-radius: 12px;
+}
+
+.ar-mode button.active {
+  background: var(--surface-2);
+  color: var(--text);
+}

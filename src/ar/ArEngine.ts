@@ -1,26 +1,36 @@
 import * as THREE from 'three';
+import { createCube, createTv } from './models';
 import {
   describeArError,
   type EngineEvent,
   type EngineListener,
+  type PlacementMode,
+  type ReticleSource,
   type ReticleState,
   type SessionInfo,
   type SurfaceType,
   type TrackingState,
+  type WallMethod,
 } from './types';
 
 /**
  * Features we ask the browser for. Only "local" tracking is required so the
  * session can start on every ARCore device; everything else is optional and
- * reported back through SessionInfo so later phases can decide what to use.
+ * reported back through SessionInfo so the UI can say what is really active.
  */
-const OPTIONAL_FEATURES = ['dom-overlay', 'hit-test', 'anchors', 'light-estimation'];
+const OPTIONAL_FEATURES = ['dom-overlay', 'hit-test', 'anchors', 'light-estimation', 'depth-sensing'];
 
 /** Pixel budget per AR frame, roughly 1080p. Above this we scale down. */
 const TARGET_PIXELS = 2_000_000;
 
-/** Phase 3 placeholder object: a 15 cm cube that sits on the surface. */
-const CUBE_SIZE = 0.15;
+/** Floor-edge fallback: height of the TV mounting point above the floor. */
+const WALL_TV_HEIGHT = 1.2;
+
+/** Depth estimates outside this range are treated as "no wall here". */
+const DEPTH_MIN = 0.3;
+const DEPTH_MAX = 8;
+
+const UP = new THREE.Vector3(0, 1, 0);
 
 /**
  * Chooses the WebXR framebuffer scale for this screen: 1.0 on phones with
@@ -34,25 +44,60 @@ export function computeRenderScale(): number {
   return Math.min(1, Math.max(0.5, Math.round(scale * 100) / 100));
 }
 
-/** Classify a hit pose by the direction its +Y axis (surface normal) points. */
-function classifySurface(orientation: DOMPointReadOnly): SurfaceType {
-  const q = new THREE.Quaternion(orientation.x, orientation.y, orientation.z, orientation.w);
-  const normal = new THREE.Vector3(0, 1, 0).applyQuaternion(q);
+/** Classify a surface by the direction of its normal. */
+function classifyNormal(normal: THREE.Vector3): SurfaceType {
   if (normal.y > 0.75) return 'horizontal';
   if (Math.abs(normal.y) < 0.35) return 'vertical';
   return 'other';
 }
 
-interface PlacedObject {
-  /** Root whose matrix is the surface pose; children are offset from it. */
-  root: THREE.Group;
-  anchor: XRAnchor | null;
-  surface: SurfaceType;
+/** Rotation whose +Y axis is `normal`; used for the flat reticle ring. */
+function quatWithUpAxis(normal: THREE.Vector3): THREE.Quaternion {
+  const helper = Math.abs(normal.y) > 0.9 ? new THREE.Vector3(0, 0, -1) : UP;
+  const right = new THREE.Vector3().crossVectors(helper, normal).normalize();
+  const forward = new THREE.Vector3().crossVectors(right, normal).normalize();
+  const m = new THREE.Matrix4().makeBasis(right, normal, forward);
+  return new THREE.Quaternion().setFromRotationMatrix(m);
 }
 
-type XRAnchorCapableHit = XRHitTestResult & {
-  createAnchor?: () => Promise<XRAnchor>;
+/** Rotation for an upright object whose front (+Z) points along `normal`. */
+function quatFacing(normal: THREE.Vector3): THREE.Quaternion {
+  const n = new THREE.Vector3(normal.x, 0, normal.z).normalize();
+  const right = new THREE.Vector3().crossVectors(UP, n).normalize();
+  const m = new THREE.Matrix4().makeBasis(right, UP, n);
+  return new THREE.Quaternion().setFromRotationMatrix(m);
+}
+
+interface PlacedObject {
+  /** Root whose matrix is the object pose; model children hang off it. */
+  root: THREE.Group;
+  anchor: XRAnchor | null;
+  kind: 'cube' | 'tv';
+  wallMethod: WallMethod | null;
+}
+
+/** The reticle's current real-world target, refreshed every frame. */
+interface Target {
+  position: THREE.Vector3;
+  normal: THREE.Vector3;
+  surface: SurfaceType;
+  source: ReticleSource;
+  /** Present only for real hit-test results (lets us anchor to the plane). */
+  hit: XRHitTestResult | null;
+}
+
+// Parts of the WebXR API that @types/webxr may not declare on this version.
+type AnchorCapableHit = XRHitTestResult & { createAnchor?: () => Promise<XRAnchor> };
+type AnchorCapableFrame = XRFrame & {
+  createAnchor?: (pose: XRRigidTransform, space: XRSpace) => Promise<XRAnchor>;
 };
+interface CpuDepthInformation {
+  getDepthInMeters(x: number, y: number): number;
+}
+type DepthCapableFrame = XRFrame & {
+  getDepthInformation?: (view: XRView) => CpuDepthInformation | null;
+};
+type DepthCapableSession = XRSession & { depthUsage?: string; enabledFeatures?: string[] };
 
 /**
  * Owns the WebXR session, the Three.js renderer and the render loop.
@@ -76,18 +121,22 @@ export class ArEngine {
   private frameCount = 0;
   private fpsWindowStart = 0;
 
-  // Hit-testing and placement
+  // Surface finding
   private hitTestSource: XRHitTestSource | null = null;
   private anchorsAvailable = false;
+  private depthAvailable = false;
+  private mode: PlacementMode = 'floor';
+
+  // Reticle
   private readonly reticle: THREE.Group;
   private readonly reticleRing: THREE.Mesh;
-  private reticleState: ReticleState = { visible: false, surface: null };
+  private reticleState: ReticleState = { visible: false, surface: null, source: null };
+  private target: Target | null = null;
+
+  // Placement
   private placeRequested = false;
   private placed: PlacedObject[] = [];
-
-  // Shared GPU resources for placeholder cubes (reused across objects)
-  private readonly cubeGeometry = new THREE.BoxGeometry(CUBE_SIZE, CUBE_SIZE, CUBE_SIZE);
-  private readonly cubeMaterial = new THREE.MeshStandardMaterial({ color: 0x4f8cff, roughness: 0.6 });
+  private lastWallMethod: WallMethod | null = null;
 
   constructor() {
     const hemi = new THREE.HemisphereLight(0xffffff, 0x667799, 1.0);
@@ -96,7 +145,7 @@ export class ArEngine {
     this.scene.add(hemi, dir);
 
     // Reticle: flat ring lying on the surface plane. RingGeometry is in XY,
-    // so rotate it into XZ where +Y is the surface normal from the hit pose.
+    // so rotate it into XZ where +Y is the surface normal.
     const ring = new THREE.Mesh(
       new THREE.RingGeometry(0.06, 0.08, 32),
       new THREE.MeshBasicMaterial({ color: 0x37c978, side: THREE.DoubleSide, transparent: true, opacity: 0.9 }),
@@ -138,17 +187,24 @@ export class ArEngine {
     const xr = navigator.xr;
     if (!xr) throw new DOMException('WebXR not available', 'NotSupportedError');
 
-    const sessionPromise = xr.requestSession('immersive-ar', {
+    const init: XRSessionInit & { depthSensing?: unknown } = {
       requiredFeatures: ['local'],
       optionalFeatures: OPTIONAL_FEATURES,
       domOverlay: { root: overlayRoot },
-    });
+      // CPU access is required to read a single depth value at the centre.
+      depthSensing: {
+        usagePreference: ['cpu-optimized'],
+        dataFormatPreference: ['luminance-alpha', 'float32'],
+      },
+    };
+    const sessionPromise = xr.requestSession('immersive-ar', init);
 
     this.endedByUser = false;
     this.trackingState = 'initializing';
     this.frameCount = 0;
     this.fpsWindowStart = 0;
     this.placeRequested = false;
+    this.lastWallMethod = null;
 
     let session: XRSession;
     try {
@@ -176,6 +232,7 @@ export class ArEngine {
 
     const info = this.collectSessionInfo(session, renderScale);
     this.anchorsAvailable = info.anchorsSupported;
+    this.depthAvailable = info.depthSensingSupported;
     await this.setupHitTest(session, info);
 
     renderer.setAnimationLoop(this.onFrame);
@@ -193,6 +250,10 @@ export class ArEngine {
     }
   }
 
+  setMode(mode: PlacementMode): void {
+    this.mode = mode;
+  }
+
   /** Ask to place an object at the reticle on the next frame. */
   requestPlace(): void {
     this.placeRequested = true;
@@ -205,6 +266,7 @@ export class ArEngine {
       obj.anchor?.delete();
     }
     this.placed = [];
+    this.lastWallMethod = null;
     this.emitObjects();
   }
 
@@ -227,9 +289,10 @@ export class ArEngine {
   }
 
   private collectSessionInfo(session: XRSession, renderScale: number): SessionInfo {
-    const withFeatures = session as XRSession & { enabledFeatures?: string[] };
-    const enabled = withFeatures.enabledFeatures ?? ['(enabledFeatures not reported by this browser)'];
+    const s = session as DepthCapableSession;
+    const enabled = s.enabledFeatures ?? ['(enabledFeatures not reported by this browser)'];
     const missing = OPTIONAL_FEATURES.filter((f) => !enabled.includes(f));
+    const depthCpu = enabled.includes('depth-sensing') && (s.depthUsage === undefined || s.depthUsage === 'cpu-optimized');
     return {
       enabledFeatures: enabled,
       missingFeatures: missing,
@@ -238,6 +301,7 @@ export class ArEngine {
       domOverlaySupported: enabled.includes('dom-overlay'),
       hitTestSupported: enabled.includes('hit-test') && typeof session.requestHitTestSource === 'function',
       anchorsSupported: enabled.includes('anchors'),
+      depthSensingSupported: depthCpu,
       renderScale,
     };
   }
@@ -263,13 +327,14 @@ export class ArEngine {
     if (!renderer) return;
 
     if (frame) {
-      this.updateTracking(frame);
       const refSpace = renderer.xr.getReferenceSpace();
+      const viewerPose = (refSpace ? frame.getViewerPose(refSpace) : null) ?? null;
+      this.updateTracking(viewerPose);
       if (refSpace) {
-        const hit = this.updateReticle(frame, refSpace);
+        this.updateTarget(frame, refSpace, viewerPose);
         if (this.placeRequested) {
           this.placeRequested = false;
-          if (hit) this.placeObject(hit, refSpace);
+          if (this.target && viewerPose) this.placeAtTarget(frame, refSpace, viewerPose);
         }
         this.updateAnchoredObjects(frame, refSpace);
       }
@@ -279,73 +344,227 @@ export class ArEngine {
     renderer.render(this.scene, this.camera);
   };
 
-  /** Moves the reticle to the first hit and returns that hit, or null. */
-  private updateReticle(frame: XRFrame, refSpace: XRReferenceSpace): XRHitTestResult | null {
-    if (!this.hitTestSource) return null;
-
-    const results = frame.getHitTestResults(this.hitTestSource);
-    let next: ReticleState = { visible: false, surface: null };
-    let hit: XRHitTestResult | null = null;
-
-    if (results.length > 0) {
-      const pose = results[0].getPose(refSpace);
+  /**
+   * Decides what the reticle points at this frame, depending on mode:
+   *
+   * floor mode: first hit-test result (green when horizontal).
+   * wall mode:  1. a vertical hit-test result (real wall detection)
+   *             2. else a depth-sensing estimate at the screen centre
+   *             3. else a horizontal hit, for the floor-edge fallback
+   */
+  private updateTarget(frame: XRFrame, refSpace: XRReferenceSpace, viewerPose: XRViewerPose | null) {
+    let hitTarget: Target | null = null;
+    if (this.hitTestSource) {
+      const results = frame.getHitTestResults(this.hitTestSource);
+      const pose = results.length > 0 ? results[0].getPose(refSpace) : null;
       if (pose) {
-        hit = results[0];
-        this.reticle.matrix.fromArray(pose.transform.matrix);
-        next = { visible: true, surface: classifySurface(pose.transform.orientation) };
+        const q = pose.transform.orientation;
+        const normal = UP.clone().applyQuaternion(new THREE.Quaternion(q.x, q.y, q.z, q.w));
+        const p = pose.transform.position;
+        hitTarget = {
+          position: new THREE.Vector3(p.x, p.y, p.z),
+          normal,
+          surface: classifyNormal(normal),
+          source: 'hit',
+          hit: results[0],
+        };
       }
     }
 
-    this.reticle.visible = next.visible;
-    if (next.visible !== this.reticleState.visible || next.surface !== this.reticleState.surface) {
-      this.reticleState = next;
-      const mat = this.reticleRing.material as THREE.MeshBasicMaterial;
-      // Green: placeable floor. Amber: wall or slope (wall placement is Phase 4).
-      mat.color.setHex(next.surface === 'horizontal' ? 0x37c978 : 0xf5b942);
-      this.emit({ type: 'reticle', reticle: next });
+    let target: Target | null = hitTarget;
+    if (this.mode === 'wall' && (!hitTarget || hitTarget.surface !== 'vertical')) {
+      const depthTarget = viewerPose ? this.estimateWallFromDepth(frame, viewerPose) : null;
+      if (depthTarget) target = depthTarget;
     }
-    return hit;
+
+    this.target = target;
+    this.applyReticle(target);
   }
 
-  private placeObject(hit: XRHitTestResult, refSpace: XRReferenceSpace) {
-    const pose = hit.getPose(refSpace);
-    if (!pose) return;
-    const surface = classifySurface(pose.transform.orientation);
-    // Phase 3 scope: floor only. Walls come in Phase 4 with their own rules.
-    if (surface !== 'horizontal') return;
+  /** Reads one depth sample at the screen centre and treats it as a wall. */
+  private estimateWallFromDepth(frame: XRFrame, viewerPose: XRViewerPose): Target | null {
+    if (!this.depthAvailable) return null;
+    const view = viewerPose.views[0];
+    if (!view) return null;
 
+    let meters: number;
+    try {
+      const depthInfo = (frame as DepthCapableFrame).getDepthInformation?.(view);
+      if (!depthInfo) return null;
+      meters = depthInfo.getDepthInMeters(0.5, 0.5);
+    } catch {
+      // Device said yes to depth-sensing but cannot deliver CPU data.
+      this.depthAvailable = false;
+      this.emit({ type: 'depth', available: false });
+      return null;
+    }
+    if (!Number.isFinite(meters) || meters < DEPTH_MIN || meters > DEPTH_MAX) return null;
+
+    const t = viewerPose.transform;
+    const camPos = new THREE.Vector3(t.position.x, t.position.y, t.position.z);
+    const camQuat = new THREE.Quaternion(t.orientation.x, t.orientation.y, t.orientation.z, t.orientation.w);
+    const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(camQuat);
+    const position = camPos.clone().addScaledVector(forward, meters);
+    // We assume the surface is a vertical wall facing the user.
+    const normal = new THREE.Vector3(-forward.x, 0, -forward.z);
+    if (normal.lengthSq() < 1e-4) return null;
+    normal.normalize();
+    return { position, normal, surface: 'vertical', source: 'depth', hit: null };
+  }
+
+  private applyReticle(target: Target | null) {
+    let next: ReticleState = { visible: false, surface: null, source: null };
+    if (target) {
+      const q = quatWithUpAxis(target.normal);
+      this.reticle.matrix.compose(target.position, q, new THREE.Vector3(1, 1, 1));
+      next = { visible: true, surface: target.surface, source: target.source };
+    }
+    this.reticle.visible = next.visible;
+
+    const changed =
+      next.visible !== this.reticleState.visible ||
+      next.surface !== this.reticleState.surface ||
+      next.source !== this.reticleState.source;
+    if (!changed) return;
+
+    this.reticleState = next;
+    const mat = this.reticleRing.material as THREE.MeshBasicMaterial;
+    const placeable = this.isPlaceable(next);
+    // Green: ready. Blue: depth estimate. Amber: not the surface this mode wants.
+    mat.color.setHex(next.source === 'depth' ? 0x4f8cff : placeable ? 0x37c978 : 0xf5b942);
+    this.emit({ type: 'reticle', reticle: next });
+  }
+
+  private isPlaceable(r: ReticleState): boolean {
+    if (!r.visible) return false;
+    if (this.mode === 'floor') return r.surface === 'horizontal' && r.source === 'hit';
+    // Wall mode accepts a wall (real or estimated) or the floor-edge fallback.
+    return r.surface === 'vertical' || r.surface === 'horizontal';
+  }
+
+  private placeAtTarget(frame: XRFrame, refSpace: XRReferenceSpace, viewerPose: XRViewerPose) {
+    const target = this.target!;
+    if (!this.isPlaceable(this.reticleState)) return;
+
+    if (this.mode === 'floor') {
+      const root = new THREE.Group();
+      root.matrixAutoUpdate = false;
+      root.matrix.compose(target.position, quatWithUpAxis(target.normal), new THREE.Vector3(1, 1, 1));
+      root.add(createCube());
+      this.addPlaced({ root, anchor: null, kind: 'cube', wallMethod: null });
+      this.anchorToHit(target.hit, this.placed[this.placed.length - 1]);
+      return;
+    }
+
+    // Wall mode: work out the mounting pose and how we got it.
+    let position: THREE.Vector3;
+    let normal: THREE.Vector3;
+    let method: WallMethod;
+    if (target.surface === 'vertical') {
+      position = target.position.clone();
+      normal = target.normal.clone();
+      method = target.source === 'hit' ? 'wall-hit' : 'depth';
+    } else {
+      // Floor-edge fallback: the reticle is on the floor where it meets the
+      // wall. Mount the TV above that point, facing back toward the user.
+      const t = viewerPose.transform.position;
+      normal = new THREE.Vector3(t.x - target.position.x, 0, t.z - target.position.z);
+      if (normal.lengthSq() < 1e-4) return;
+      normal.normalize();
+      position = target.position.clone().add(new THREE.Vector3(0, WALL_TV_HEIGHT, 0));
+      method = 'floor-edge';
+    }
+
+    const quat = quatFacing(normal);
     const root = new THREE.Group();
     root.matrixAutoUpdate = false;
-    root.matrix.fromArray(pose.transform.matrix);
+    root.matrix.compose(position, quat, new THREE.Vector3(1, 1, 1));
+    root.add(createTv());
+    const obj: PlacedObject = { root, anchor: null, kind: 'tv', wallMethod: method };
+    this.lastWallMethod = method;
+    this.addPlaced(obj);
 
-    const cube = new THREE.Mesh(this.cubeGeometry, this.cubeMaterial);
-    cube.position.y = CUBE_SIZE / 2; // sit on the surface, not inside it
-    root.add(cube);
-    this.scene.add(root);
+    if (method === 'wall-hit') {
+      // A plane-attached anchor: the TV follows ARCore's refinements of the wall.
+      // Its pose is the hit pose, so re-express the TV pose relative to it.
+      this.anchorToHit(target.hit, obj, { position, quat });
+    } else {
+      this.anchorToPose(frame, refSpace, obj, position, quat);
+    }
+  }
 
-    const obj: PlacedObject = { root, anchor: null, surface };
+  private addPlaced(obj: PlacedObject) {
+    this.scene.add(obj.root);
     this.placed.push(obj);
     this.emitObjects();
+  }
 
-    // Anchors let ARCore keep refining the object's real-world position as
-    // its understanding of the room improves. Must be created while the hit
-    // result's frame is still active, i.e. inside this animation frame.
-    const anchorable = hit as XRAnchorCapableHit;
-    if (this.anchorsAvailable && typeof anchorable.createAnchor === 'function') {
-      anchorable
-        .createAnchor()
-        .then((anchor) => {
-          if (!this.placed.includes(obj)) {
-            anchor.delete();
-            return;
-          }
-          obj.anchor = anchor;
-          this.emitObjects();
-        })
-        .catch(() => {
-          // Anchor failed: the object simply keeps its static pose.
-        });
+  /**
+   * Anchors `obj` to a hit-test result. When the object's pose differs from
+   * the hit pose, the model is re-parented with the offset so that the root
+   * can track the anchor directly.
+   */
+  private anchorToHit(
+    hit: XRHitTestResult | null,
+    obj: PlacedObject,
+    desired?: { position: THREE.Vector3; quat: THREE.Quaternion },
+  ) {
+    const anchorable = hit as AnchorCapableHit | null;
+    if (!this.anchorsAvailable || !anchorable || typeof anchorable.createAnchor !== 'function') return;
+
+    if (desired) {
+      // root will follow the anchor (hit pose); put the model under an inner
+      // group carrying the offset from hit pose to desired pose.
+      const hitPose = new THREE.Matrix4().copy(obj.root.matrix);
+      const desiredM = new THREE.Matrix4().compose(desired.position, desired.quat, new THREE.Vector3(1, 1, 1));
+      const offset = new THREE.Matrix4().copy(hitPose).invert().multiply(desiredM);
+      const inner = new THREE.Group();
+      inner.matrixAutoUpdate = false;
+      inner.matrix.copy(offset);
+      for (const child of [...obj.root.children]) inner.add(child);
+      obj.root.add(inner);
     }
+
+    anchorable
+      .createAnchor()
+      .then((anchor) => this.attachAnchor(obj, anchor))
+      .catch(() => {
+        // Anchor failed: the object keeps its static pose.
+      });
+  }
+
+  /** Anchors `obj` at an arbitrary pose (depth or floor-edge placements). */
+  private anchorToPose(
+    frame: XRFrame,
+    refSpace: XRReferenceSpace,
+    obj: PlacedObject,
+    position: THREE.Vector3,
+    quat: THREE.Quaternion,
+  ) {
+    const f = frame as AnchorCapableFrame;
+    if (!this.anchorsAvailable || typeof f.createAnchor !== 'function') return;
+    try {
+      const transform = new XRRigidTransform(
+        { x: position.x, y: position.y, z: position.z, w: 1 },
+        { x: quat.x, y: quat.y, z: quat.z, w: quat.w },
+      );
+      f.createAnchor(transform, refSpace)
+        .then((anchor) => this.attachAnchor(obj, anchor))
+        .catch(() => {
+          // Keep static pose.
+        });
+    } catch {
+      // XRRigidTransform or createAnchor unavailable: keep static pose.
+    }
+  }
+
+  private attachAnchor(obj: PlacedObject, anchor: XRAnchor) {
+    if (!this.placed.includes(obj)) {
+      anchor.delete();
+      return;
+    }
+    obj.anchor = anchor;
+    this.emitObjects();
   }
 
   private updateAnchoredObjects(frame: XRFrame, refSpace: XRReferenceSpace) {
@@ -363,6 +582,7 @@ export class ArEngine {
       type: 'objects',
       count: this.placed.length,
       anchored: this.placed.filter((o) => o.anchor !== null).length,
+      lastWallMethod: this.lastWallMethod,
     });
   }
 
@@ -384,12 +604,7 @@ export class ArEngine {
     }
   }
 
-  private updateTracking(frame: XRFrame) {
-    const renderer = this.renderer!;
-    const refSpace = renderer.xr.getReferenceSpace();
-    if (!refSpace) return;
-
-    const pose = frame.getViewerPose(refSpace);
+  private updateTracking(pose: XRViewerPose | null) {
     let next: TrackingState;
     if (!pose) {
       next = this.trackingState === 'initializing' ? 'initializing' : 'lost';
@@ -398,7 +613,6 @@ export class ArEngine {
     } else {
       next = 'tracking';
     }
-
     if (next !== this.trackingState) {
       this.trackingState = next;
       this.emit({ type: 'tracking', state: next });
@@ -430,11 +644,13 @@ export class ArEngine {
       obj.anchor?.delete();
     }
     this.placed = [];
+    this.lastWallMethod = null;
 
     this.hitTestSource?.cancel();
     this.hitTestSource = null;
+    this.target = null;
     this.reticle.visible = false;
-    this.reticleState = { visible: false, surface: null };
+    this.reticleState = { visible: false, surface: null, source: null };
 
     if (this.renderer) {
       this.renderer.setAnimationLoop(null);

@@ -6,10 +6,24 @@ export type TrackingState = 'initializing' | 'tracking' | 'limited' | 'lost';
  */
 export type SurfaceType = 'horizontal' | 'vertical' | 'other';
 
+/** What the user is trying to place right now. */
+export type PlacementMode = 'floor' | 'wall';
+
+/**
+ * Where the reticle pose came from.
+ * - hit: a real WebXR hit-test result on a detected plane
+ * - depth: estimated from the depth-sensing API at the screen centre
+ */
+export type ReticleSource = 'hit' | 'depth';
+
 export interface ReticleState {
   visible: boolean;
   surface: SurfaceType | null;
+  source: ReticleSource | null;
 }
+
+/** How a wall object ended up where it is. Shown to the user, never hidden. */
+export type WallMethod = 'wall-hit' | 'depth' | 'floor-edge';
 
 /** Facts about the running session, reported once it has started. */
 export interface SessionInfo {
@@ -22,6 +36,8 @@ export interface SessionInfo {
   domOverlaySupported: boolean;
   hitTestSupported: boolean;
   anchorsSupported: boolean;
+  /** Depth-sensing granted and readable on the CPU. */
+  depthSensingSupported: boolean;
   /** WebXR framebuffer scale actually used (1 = native, 0.5 = quarter pixels). */
   renderScale: number;
 }
@@ -38,7 +54,8 @@ export type EngineEvent =
   | { type: 'visibility'; state: XRVisibilityState }
   | { type: 'fps'; fps: number }
   | { type: 'reticle'; reticle: ReticleState }
-  | { type: 'objects'; count: number; anchored: number }
+  | { type: 'objects'; count: number; anchored: number; lastWallMethod: WallMethod | null }
+  | { type: 'depth'; available: boolean }
   | { type: 'ended'; reason: 'user' | 'browser' }
   | { type: 'error'; error: ArError };
 

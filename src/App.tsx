@@ -4,9 +4,11 @@ import { ArEngine } from './ar/ArEngine';
 import {
   describeArError,
   type ArError,
+  type PlacementMode,
   type ReticleState,
   type SessionInfo,
   type TrackingState,
+  type WallMethod,
 } from './ar/types';
 import ArOverlay from './components/ArOverlay';
 import Landing from './components/Landing';
@@ -15,7 +17,7 @@ type Screen = 'landing' | 'ar';
 
 const UI_PREVIEW = new URLSearchParams(window.location.search).get('ui') === 'preview';
 
-const NO_RETICLE: ReticleState = { visible: false, surface: null };
+const NO_RETICLE: ReticleState = { visible: false, surface: null, source: null };
 
 export default function App() {
   const engineRef = useRef<ArEngine | null>(null);
@@ -32,22 +34,27 @@ export default function App() {
   const [info, setInfo] = useState<SessionInfo | null>(null);
   const [visibility, setVisibility] = useState<XRVisibilityState>('visible');
   const [fps, setFps] = useState(0);
+  const [mode, setMode] = useState<PlacementMode>('floor');
   const [reticle, setReticle] = useState<ReticleState>(
-    UI_PREVIEW ? { visible: true, surface: 'horizontal' } : NO_RETICLE,
+    UI_PREVIEW ? { visible: true, surface: 'horizontal', source: 'hit' } : NO_RETICLE,
   );
+  const [depthAvailable, setDepthAvailable] = useState(false);
   const [objectCount, setObjectCount] = useState(0);
   const [anchoredCount, setAnchoredCount] = useState(0);
+  const [lastWallMethod, setLastWallMethod] = useState<WallMethod | null>(null);
 
   useEffect(() => {
     return engine.subscribe((e) => {
       switch (e.type) {
         case 'started':
           setInfo(e.info);
+          setDepthAvailable(e.info.depthSensingSupported);
           setTracking('initializing');
           setVisibility('visible');
           setReticle(NO_RETICLE);
           setObjectCount(0);
           setAnchoredCount(0);
+          setLastWallMethod(null);
           break;
         case 'tracking':
           setTracking(e.state);
@@ -61,9 +68,13 @@ export default function App() {
         case 'reticle':
           setReticle(e.reticle);
           break;
+        case 'depth':
+          setDepthAvailable(e.available);
+          break;
         case 'objects':
           setObjectCount(e.count);
           setAnchoredCount(e.anchored);
+          setLastWallMethod(e.lastWallMethod);
           break;
         case 'ended':
           setScreen('landing');
@@ -90,6 +101,7 @@ export default function App() {
     if (!canvasHost.current || !overlayRoot) return;
     setNotice(null);
     setScreen('ar');
+    engine.setMode(mode);
     engine.start(canvasHost.current, overlayRoot).catch((err) => {
       // 'error' event already carried the friendly message; this is a safety net.
       setNotice(describeArError(err));
@@ -105,9 +117,18 @@ export default function App() {
     void engine.end();
   };
 
+  const handleModeChange = (next: PlacementMode) => {
+    setMode(next);
+    engine.setMode(next);
+    if (UI_PREVIEW) {
+      setReticle({ visible: true, surface: next === 'floor' ? 'horizontal' : 'vertical', source: 'hit' });
+    }
+  };
+
   const handlePlace = () => {
     if (UI_PREVIEW) {
       setObjectCount((c) => c + 1);
+      if (mode === 'wall') setLastWallMethod('wall-hit');
       return;
     }
     engine.requestPlace();
@@ -116,6 +137,7 @@ export default function App() {
   const handleClear = () => {
     if (UI_PREVIEW) {
       setObjectCount(0);
+      setLastWallMethod(null);
       return;
     }
     engine.clearObjects();
@@ -138,9 +160,13 @@ export default function App() {
             info={info}
             visibility={visibility}
             fps={fps}
+            mode={mode}
             reticle={reticle}
+            depthAvailable={depthAvailable}
             objectCount={objectCount}
             anchoredCount={anchoredCount}
+            lastWallMethod={lastWallMethod}
+            onModeChange={handleModeChange}
             onPlace={handlePlace}
             onClear={handleClear}
             onExit={handleExit}

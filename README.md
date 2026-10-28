@@ -10,9 +10,9 @@ app, no paid SDKs, no backend.
 | ----- | ---- | ----- |
 | 1 | React + TypeScript + Vite + Three.js project, landing screen, WebXR support check | Done |
 | 2 | Real immersive-ar session starts on an Android device | Done, verified on device |
-| 3 | Hit-testing, reticle, cubes placed on the floor with anchors | Built, awaiting phone test |
-| 4 | Vertical wall placement investigation, single TV model | Next |
-| 5 | Multi-object manager and touch manipulation | Pending |
+| 3 | Hit-testing, reticle, cubes placed on the floor with anchors | Done, verified on device |
+| 4 | Wall placement: hit-test, depth estimate, floor-edge fallback; placeholder TV | Built, awaiting phone test |
+| 5 | Multi-object manager and touch manipulation | Next |
 | 6 | Catalogue, error handling, performance, JSON export/import | Pending |
 | 7 | Free HTTPS deployment and QR code | Pending |
 
@@ -59,7 +59,8 @@ src/
   ar/
     support.ts        WebXR capability detection (no session started)
     types.ts          Tracking state, session info, error mapping
-    ArEngine.ts       WebXR session, renderer, hit-test reticle, anchors, placement
+    ArEngine.ts       WebXR session, renderer, hit-test/depth reticle, anchors, placement
+    models.ts         Placeholder cube and TV built from primitives (GLB later)
   components/
     Landing.tsx       Start screen, device check, instructions
     ArOverlay.tsx     In-session UI (dom-overlay): status, details, Exit
@@ -78,9 +79,19 @@ desktop. It is clearly labelled and starts no AR session.
 ## Honest limitations
 
 - Only Android Chrome is targeted. iOS Safari does not implement WebXR AR.
-- Vertical (wall) hit-testing is not guaranteed by every ARCore device. The
-  wall-placement phase will measure what the device actually reports and
-  document a labelled manual fallback where needed.
+- Vertical (wall) hit-testing is not guaranteed. WebXR only reports a wall
+  when ARCore has detected a vertical plane, which needs a textured wall and
+  time; plain painted walls are often never detected. On the first test
+  device the floor was detected within seconds and the wall never was.
+  Wall mode therefore uses, in order:
+  1. A real vertical hit-test result when one exists (green ring).
+  2. The WebXR depth-sensing API, reading the distance at the screen centre
+     and assuming a vertical wall facing the user (blue ring, labelled
+     "estimated"). Only on devices that grant `depth-sensing`.
+  3. A clearly labelled manual fallback: aim at the floor where it meets the
+     wall; the TV is mounted 1.2 m above that point facing the user (amber
+     ring). Phase 5 adds move and rotate controls to fine-tune it.
+  The method used is always shown in the guide text and the "i" panel.
 - Exported JSON stores virtual coordinates relative to the AR session origin.
   Re-importing in a new session does not restore objects to the same
   real-world spot without persistent anchors.
