@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react';
 import type { GestureEvent } from '../ar/ArEngine';
 import { CATALOGUE } from '../ar/models';
-import type { MotionHoldState, ObjectKind, ObjectSummary, SessionInfo, TrackingState } from '../ar/types';
+import type { ObjectKind, ObjectSummary, SessionInfo, TrackingState } from '../ar/types';
 
 interface ArOverlayProps {
   tracking: TrackingState;
@@ -10,9 +10,6 @@ interface ArOverlayProps {
   /** Rendered frames per second, updated once a second. 0 until measured. */
   fps: number;
   floorKnown: boolean;
-  /** Objects are being held by the motion sensor while camera tracking is paused. */
-  holding: boolean;
-  motionHold: MotionHoldState;
   objects: ObjectSummary[];
   selectedId: string | null;
   canUndo: boolean;
@@ -51,17 +48,8 @@ const STEP_M = 0.05;
 const STEP_DEG = 10;
 const STEP_SCALE = 1.1;
 
-const MOTION_HOLD_LABEL: Record<MotionHoldState, string> = {
-  off: 'not available on this device',
-  calibrating: 'calibrating (turn the device a little while tracking is green)',
-  ready: 'ready',
-  unusable: 'sensor did not match the camera, not used',
-};
-
-function guidance(tracking: TrackingState, holding: boolean, hasObjects: boolean, hasSelection: boolean): string {
+function guidance(tracking: TrackingState, hasObjects: boolean, hasSelection: boolean): string {
   if (tracking === 'initializing') return 'Move your phone slowly over the floor to scan the area.';
-  if (holding)
-    return 'Camera tracking paused here. Objects are held by the motion sensor and lock back in when it resumes.';
   if (tracking === 'lost')
     return 'Camera tracking paused, objects hidden until it resumes. Aim at something with texture and move slowly.';
   if (tracking === 'limited') return 'Tracking is weak here. Move slowly; textured surfaces help.';
@@ -82,8 +70,6 @@ export default function ArOverlay({
   visibility,
   fps,
   floorKnown,
-  holding,
-  motionHold,
   objects,
   selectedId,
   canUndo,
@@ -156,9 +142,9 @@ export default function ArOverlay({
       {previewMode && <div className="ar-banner">UI preview only. No AR session is running.</div>}
 
       <header className="ar-top">
-        <div className={`ar-status ${holding ? 'limited' : tracking}`}>
+        <div className={`ar-status ${tracking}`}>
           <span className="dot" />
-          {paused ? 'Paused' : holding ? 'Holding' : TRACKING_LABEL[tracking]}
+          {paused ? 'Paused' : TRACKING_LABEL[tracking]}
         </div>
         <div className="ar-top-actions">
           <button className="ar-icon-btn" aria-label="Session details" onClick={() => setShowInfo((s) => !s)}>
@@ -182,7 +168,6 @@ export default function ArOverlay({
               <div className="hint">Floor height: {floorKnown ? 'known' : 'not yet (boxes spawn 1.4 m below eye)'}</div>
               <div className="hint">Objects: {objects.length}</div>
               <div className="hint">Anchors: {info.anchorsSupported ? 'supported' : 'unavailable'}</div>
-              <div className="hint">Motion-sensor hold: {MOTION_HOLD_LABEL[motionHold]}</div>
               <div className="hint">Blend mode: {info.environmentBlendMode}</div>
               <div className="hint">Render rate: {fps ? `${fps} fps` : 'measuring'}</div>
               <div className="hint">Render scale: {info.renderScale}</div>
@@ -200,7 +185,7 @@ export default function ArOverlay({
         <div className="ar-guide">
           {paused
             ? 'AR is paused. Return to this tab to continue.'
-            : guidance(tracking, holding, objects.length > 0, !!selected)}
+            : guidance(tracking, objects.length > 0, !!selected)}
         </div>
 
         {selected ? (

@@ -4,7 +4,6 @@ import { ArEngine, type GestureEvent } from './ar/ArEngine';
 import {
   describeArError,
   type ArError,
-  type MotionHoldState,
   type ObjectKind,
   type ObjectSummary,
   type SessionInfo,
@@ -33,8 +32,6 @@ export default function App() {
   const [visibility, setVisibility] = useState<XRVisibilityState>('visible');
   const [fps, setFps] = useState(0);
   const [floorKnown, setFloorKnown] = useState(false);
-  const [holding, setHolding] = useState(false);
-  const [motionHold, setMotionHold] = useState<MotionHoldState>('off');
   const [objects, setObjects] = useState<ObjectSummary[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [canUndo, setCanUndo] = useState(false);
@@ -47,13 +44,6 @@ export default function App() {
           setTracking('initializing');
           setVisibility('visible');
           setFloorKnown(false);
-          setHolding(false);
-          break;
-        case 'hold':
-          setHolding(e.active);
-          break;
-        case 'sensor':
-          setMotionHold(e.state);
           break;
         case 'tracking':
           setTracking(e.state);
@@ -75,8 +65,6 @@ export default function App() {
         case 'ended':
           setScreen('landing');
           setInfo(null);
-          setHolding(false);
-          setMotionHold('off');
           setObjects([]);
           setSelectedId(null);
           setCanUndo(false);
@@ -193,8 +181,6 @@ export default function App() {
             visibility={visibility}
             fps={fps}
             floorKnown={floorKnown}
-            holding={holding}
-            motionHold={motionHold}
             objects={objects}
             selectedId={selectedId}
             canUndo={canUndo}

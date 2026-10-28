@@ -1,11 +1,9 @@
 import * as THREE from 'three';
-import { holdMatrix, relativeRotation, SensorCalibrator, type CalibrationResult } from './hold';
 import { getModelSpec } from './models';
 import {
   describeArError,
   type EngineEvent,
   type EngineListener,
-  type MotionHoldState,
   type ObjectKind,
   type ObjectSummary,
   type SessionInfo,
@@ -14,20 +12,10 @@ import {
 
 /**
  * Only "local" tracking is required so the session can start on every
- * ARCore device. Hit-testing is optional and used for one thing: learning
- * the floor height so floor objects spawn at the right level. No planes,
- * walls or anchors are involved in placement; objects are fixed in the
- * session's local space and only move when the user moves them.
+ * ARCore device. Anchors keep objects fixed to the real world; hit-testing
+ * is used only to learn the floor height so floor objects spawn on it.
  */
 const OPTIONAL_FEATURES = ['dom-overlay', 'hit-test', 'anchors'];
-
-/** Anchor corrections below these are ignored as tracking noise. */
-const ANCHOR_DEADBAND_M = 0.008;
-const ANCHOR_DEADBAND_RAD = THREE.MathUtils.degToRad(0.75);
-/** Per-frame blend toward the anchor pose for corrections above the deadband. */
-const ANCHOR_SMOOTHING = 0.08;
-/** A correction this large is a relocalisation; apply it at once. */
-const ANCHOR_SNAP_M = 0.3;
 
 /** Pixel budget per AR frame, roughly 1080p. Above this we scale down. */
 const TARGET_PIXELS = 2_000_000;
@@ -45,6 +33,11 @@ const MIN_SCALE = 0.2;
 const MAX_SCALE = 5;
 const MAX_DISTANCE = 12;
 
+/** If an edit moves an object this far from its anchor, give it a new one nearby. */
+const REANCHOR_DISTANCE = 0.5;
+/** Frames an anchor may stay untracked (while the camera tracks) before it is replaced. */
+const ANCHOR_UNTRACKED_LIMIT = 120;
+
 /** One-finger movement below this (normalized screen units) is a tap. */
 const TAP_SLOP = 0.01;
 /** Two-finger vertical drag: metres of push/pull per full screen height. */
@@ -55,12 +48,10 @@ const PINCH_START = 0.08;
 const TWIST_START = THREE.MathUtils.degToRad(6);
 const PUSH_START = 0.04;
 
-/** Frames without a camera pose before objects are hidden (about 0.2 s). */
-const HIDE_AFTER_NO_POSE_FRAMES = 12;
-
 const UNDO_LIMIT = 30;
 
 const UP = new THREE.Vector3(0, 1, 0);
+const ONE = new THREE.Vector3(1, 1, 1);
 
 /**
  * Chooses the WebXR framebuffer scale for this screen: 1.0 on phones with
@@ -91,38 +82,37 @@ export interface GestureEvent {
   y: number;
 }
 
+/**
+ * A placed object. Its pose is stored relative to an ARCore anchor, the way
+ * the WebXR anchors sample does it: every frame the object is put exactly at
+ * anchorPose * offset. ARCore corrects the camera and the anchors together,
+ * so following the anchor exactly is what keeps the object fixed in the room.
+ * Any filtering of that pose makes the object lag behind the correction and
+ * appear to slide.
+ */
 interface SceneObject {
   id: string;
   kind: ObjectKind;
   spawn: 'floor' | 'eye';
+  /** root.position / root.quaternion are the world pose; scale is separate. */
   root: THREE.Group;
   outline: THREE.LineSegments;
   anchor: XRAnchor | null;
-  /** True when the user moved it and the anchor must be recreated. */
-  anchorDirty: boolean;
+  /** Latest anchor pose in the reference space. */
+  readonly anchorMatrix: THREE.Matrix4;
+  /** Rigid transform from the anchor to the object. */
+  readonly offset: THREE.Matrix4;
+  /** False until the first pose of a new anchor has arrived. */
+  offsetValid: boolean;
+  /** Create an anchor at the object's current pose on the next frame. */
+  needsAnchor: boolean;
   anchorPending: boolean;
+  untrackedFrames: number;
 }
 
 type AnchorCapableFrame = XRFrame & {
   createAnchor?: (pose: XRRigidTransform, space: XRSpace) => Promise<XRAnchor>;
 };
-
-/** The Generic Sensor API's RelativeOrientationSensor, which @types may lack. */
-interface OrientationSensorLike extends EventTarget {
-  quaternion?: number[] | null;
-  start(): void;
-  stop(): void;
-}
-type OrientationSensorCtor = new (options: {
-  frequency: number;
-  referenceFrame: 'device' | 'screen';
-}) => OrientationSensorLike;
-
-function holdStateOf(result: CalibrationResult): MotionHoldState {
-  if (result === 'calibrating') return 'calibrating';
-  if (result === 'unusable') return 'unusable';
-  return 'ready';
-}
 
 interface Transform {
   position: THREE.Vector3;
@@ -188,25 +178,12 @@ export class ArEngine {
   private statsEnabled = false;
   private lostFrames = 0;
   private limitedFrames = 0;
-  private noPoseFrames = 0;
+  /** True on frames where WebXR gave a viewer pose. */
+  private hasPose = false;
 
   private hitTestSource: XRHitTestSource | null = null;
   private floorY: number | null = null;
   private anchorsAvailable = false;
-
-  // Motion-sensor hold while camera tracking is paused. Placed objects live
-  // under `world`, whose matrix is identity except during a hold.
-  private readonly world = new THREE.Group();
-  private sensor: OrientationSensorLike | null = null;
-  private sensorQuat: THREE.Quaternion | null = null;
-  private readonly calibrator = new SensorCalibrator();
-  private sensorState: MotionHoldState = 'off';
-  private holding = false;
-  private hasLastGood = false;
-  private lastHadSensor = false;
-  private readonly lastCamPos = new THREE.Vector3();
-  private readonly lastCamQuat = new THREE.Quaternion();
-  private readonly lastSensorQuat = new THREE.Quaternion();
 
   private objects: SceneObject[] = [];
   private selectedId: string | null = null;
@@ -218,13 +195,15 @@ export class ArEngine {
   private readonly raycaster = new THREE.Raycaster();
   private readonly outlineMaterial = new THREE.LineBasicMaterial({ color: 0xf5b942 });
 
+  // Scratch objects reused every frame to avoid garbage.
+  private readonly tmpMatrix = new THREE.Matrix4();
+  private readonly tmpScale = new THREE.Vector3();
+
   constructor() {
     const hemi = new THREE.HemisphereLight(0xffffff, 0x667799, 1.0);
     const dir = new THREE.DirectionalLight(0xffffff, 0.8);
     dir.position.set(0.5, 1, 0.25);
     this.scene.add(hemi, dir);
-    this.world.matrixAutoUpdate = false;
-    this.scene.add(this.world);
   }
 
   subscribe(listener: EngineListener): () => void {
@@ -264,6 +243,7 @@ export class ArEngine {
     this.limitedFrames = 0;
     this.frameCount = 0;
     this.fpsWindowStart = 0;
+    this.hasPose = false;
 
     let session: XRSession;
     try {
@@ -292,107 +272,6 @@ export class ArEngine {
     renderer.setAnimationLoop(this.onFrame);
     this.emit({ type: 'started', info });
     this.emitObjects();
-    this.startSensor();
-  }
-
-  // ----- Motion sensor -----
-
-  private startSensor() {
-    const Ctor = (window as unknown as { RelativeOrientationSensor?: OrientationSensorCtor })
-      .RelativeOrientationSensor;
-    if (!Ctor) {
-      this.setSensorState('off');
-      return;
-    }
-    try {
-      const sensor = new Ctor({ frequency: 60, referenceFrame: 'screen' });
-      sensor.addEventListener('reading', () => {
-        const q = sensor.quaternion;
-        if (!q) return;
-        if (!this.sensorQuat) this.sensorQuat = new THREE.Quaternion();
-        this.sensorQuat.set(q[0], q[1], q[2], q[3]);
-      });
-      sensor.addEventListener('error', () => {
-        this.stopSensor();
-        this.setSensorState('off');
-      });
-      sensor.start();
-      this.sensor = sensor;
-      this.calibrator.reset();
-      this.setSensorState('calibrating');
-    } catch {
-      this.setSensorState('off');
-    }
-  }
-
-  private stopSensor() {
-    try {
-      this.sensor?.stop();
-    } catch {
-      // Already stopped.
-    }
-    this.sensor = null;
-    this.sensorQuat = null;
-  }
-
-  private setSensorState(state: MotionHoldState) {
-    if (state === this.sensorState) return;
-    this.sensorState = state;
-    this.emit({ type: 'sensor', state });
-  }
-
-  private setHolding(active: boolean) {
-    if (active === this.holding) return;
-    this.holding = active;
-    if (!active) {
-      this.world.matrix.identity();
-      this.world.matrixWorldNeedsUpdate = true;
-    }
-    this.emit({ type: 'hold', active });
-  }
-
-  /**
-   * With a camera pose: remember it with the matching sensor reading, feed
-   * the calibrator, and end any hold. Without one: if the sensor has been
-   * verified against the camera, rotate the world so objects stay where
-   * they were as the user turns the device.
-   */
-  private updateHold(viewerPose: XRViewerPose | null) {
-    if (viewerPose) {
-      const t = (viewerPose.views[0] ?? viewerPose).transform;
-      this.lastCamPos.set(t.position.x, t.position.y, t.position.z);
-      this.lastCamQuat.set(t.orientation.x, t.orientation.y, t.orientation.z, t.orientation.w);
-      this.hasLastGood = true;
-      this.lastHadSensor = this.sensorQuat !== null;
-      if (this.sensorQuat) {
-        this.lastSensorQuat.copy(this.sensorQuat);
-        if (!viewerPose.emulatedPosition && this.sensorState !== 'off') {
-          this.setSensorState(holdStateOf(this.calibrator.add(this.lastCamQuat, this.sensorQuat)));
-        }
-      }
-      this.setHolding(false);
-      return;
-    }
-
-    const convention = this.calibrator.result;
-    if (
-      this.sensorState !== 'ready' ||
-      !this.hasLastGood ||
-      !this.lastHadSensor ||
-      !this.sensorQuat ||
-      (convention !== 'device-to-ref' && convention !== 'ref-to-device')
-    ) {
-      return;
-    }
-    const r = relativeRotation(convention, this.lastSensorQuat, this.sensorQuat);
-    holdMatrix(this.lastCamPos, this.lastCamQuat, r, this.world.matrix);
-    this.world.matrixWorldNeedsUpdate = true;
-    this.setHolding(true);
-  }
-
-  /** Editing needs the live camera, so it pauses while tracking does. */
-  private get canEdit(): boolean {
-    return !this.holding && this.noPoseFrames === 0;
   }
 
   /** Ends the session. Resolves after cleanup; safe to call twice. */
@@ -464,14 +343,12 @@ export class ArEngine {
       const refSpace = renderer.xr.getReferenceSpace();
       const viewerPose = (refSpace ? frame.getViewerPose(refSpace) : null) ?? null;
       this.updateTracking(viewerPose);
-      // No pose means ARCore has paused camera tracking. If the motion
-      // sensor is verified, objects are held in place by it. Otherwise they
-      // are hidden after a short grace period, because drawing them with a
-      // stale camera makes them look glued to the screen.
-      this.noPoseFrames = viewerPose ? 0 : this.noPoseFrames + 1;
-      this.updateHold(viewerPose);
-      this.scene.visible = this.holding || this.noPoseFrames < HIDE_AFTER_NO_POSE_FRAMES;
-      if (refSpace) {
+      this.hasPose = viewerPose !== null;
+      // Like the WebXR samples: with no viewer pose there is nothing correct
+      // to draw. Three.js would otherwise reuse the last camera and the
+      // objects would look glued to the screen.
+      this.scene.visible = this.hasPose;
+      if (refSpace && this.hasPose) {
         this.learnFloor(frame, refSpace);
         this.updateAnchors(frame, refSpace);
       }
@@ -483,64 +360,84 @@ export class ArEngine {
 
   // ----- Anchors -----
 
-  /**
-   * Anchors exist for one reason here: after tracking is lost and found
-   * again, ARCore moves anchors back to the right real-world spot, while a
-   * static pose would be left wherever the relocalised origin put it.
-   * To stop anchors from making objects shiver, corrections below a
-   * deadband are ignored, larger ones ease in, and nothing is applied while
-   * tracking is degraded or the object is being dragged.
-   */
   private updateAnchors(frame: XRFrame, refSpace: XRReferenceSpace) {
-    // Anchor poses are in world space; skip them while there is no camera
-    // pose (and the world may be rotated for a motion-sensor hold).
-    if (!this.anchorsAvailable || this.noPoseFrames > 0) return;
+    if (!this.anchorsAvailable) return;
     const f = frame as AnchorCapableFrame;
 
     for (const obj of this.objects) {
-      if (obj.anchorDirty && !obj.anchorPending && typeof f.createAnchor === 'function') {
-        obj.anchorDirty = false;
-        obj.anchorPending = true;
-        const old = obj.anchor;
-        obj.anchor = null;
-        old?.delete();
-        const p = obj.root.position;
-        const q = obj.root.quaternion;
-        try {
-          f.createAnchor(new XRRigidTransform({ x: p.x, y: p.y, z: p.z, w: 1 }, { x: q.x, y: q.y, z: q.z, w: q.w }), refSpace)
-            .then((anchor) => {
-              obj.anchorPending = false;
-              if (!this.objects.includes(obj) || obj.anchorDirty) {
-                anchor.delete();
-                return;
-              }
-              obj.anchor = anchor;
-            })
-            .catch(() => {
-              obj.anchorPending = false;
-            });
-        } catch {
-          obj.anchorPending = false;
+      if (obj.needsAnchor && !obj.anchorPending && typeof f.createAnchor === 'function') {
+        this.createAnchorFor(obj, f, refSpace);
+      }
+
+      if (!obj.anchor) {
+        obj.root.visible = true;
+        continue;
+      }
+
+      const pose = frame.getPose(obj.anchor.anchorSpace, refSpace);
+      if (!pose) {
+        // The anchor is not tracked right now. Hide the object rather than
+        // draw it somewhere that may be wrong, as the samples do. If this
+        // lasts while the camera itself tracks, replace the anchor.
+        obj.root.visible = false;
+        obj.untrackedFrames += 1;
+        if (obj.untrackedFrames > ANCHOR_UNTRACKED_LIMIT) {
+          obj.anchor.delete();
+          obj.anchor = null;
+          obj.needsAnchor = true;
+          obj.root.visible = true;
         }
         continue;
       }
 
-      if (!obj.anchor || this.trackingState !== 'tracking' || this.isBeingManipulated(obj.id)) continue;
-      const pose = frame.getPose(obj.anchor.anchorSpace, refSpace);
-      if (!pose) continue;
+      obj.untrackedFrames = 0;
+      obj.root.visible = true;
+      obj.anchorMatrix.fromArray(pose.transform.matrix);
+      if (!obj.offsetValid) {
+        this.recomputeOffset(obj);
+        obj.offsetValid = true;
+      }
+      if (this.isBeingManipulated(obj.id)) continue;
 
-      const p = pose.transform.position;
-      const q = pose.transform.orientation;
-      const anchorPos = new THREE.Vector3(p.x, p.y, p.z);
-      const anchorQuat = new THREE.Quaternion(q.x, q.y, q.z, q.w);
-      const moved = obj.root.position.distanceTo(anchorPos);
-      const turned = obj.root.quaternion.angleTo(anchorQuat);
-      if (moved < ANCHOR_DEADBAND_M && turned < ANCHOR_DEADBAND_RAD) continue;
-
-      const t = moved > ANCHOR_SNAP_M ? 1 : ANCHOR_SMOOTHING;
-      obj.root.position.lerp(anchorPos, t);
-      obj.root.quaternion.slerp(anchorQuat, t);
+      // Exactly anchorPose * offset, every frame, no filtering.
+      this.tmpMatrix.multiplyMatrices(obj.anchorMatrix, obj.offset);
+      this.tmpMatrix.decompose(obj.root.position, obj.root.quaternion, this.tmpScale);
     }
+  }
+
+  private createAnchorFor(obj: SceneObject, frame: AnchorCapableFrame, refSpace: XRReferenceSpace) {
+    obj.needsAnchor = false;
+    obj.anchorPending = true;
+    const p = obj.root.position;
+    const q = obj.root.quaternion;
+    try {
+      frame
+        .createAnchor!(new XRRigidTransform({ x: p.x, y: p.y, z: p.z, w: 1 }, { x: q.x, y: q.y, z: q.z, w: q.w }), refSpace)
+        .then((anchor) => {
+          obj.anchorPending = false;
+          if (!this.objects.includes(obj)) {
+            anchor.delete();
+            return;
+          }
+          obj.anchor?.delete();
+          obj.anchor = anchor;
+          obj.untrackedFrames = 0;
+          // The offset is computed from the object's pose when the anchor's
+          // first pose arrives, so edits made meanwhile are kept.
+          obj.offsetValid = false;
+        })
+        .catch(() => {
+          obj.anchorPending = false;
+        });
+    } catch {
+      obj.anchorPending = false;
+    }
+  }
+
+  /** offset = anchorPose^-1 * objectPose (rigid; scale is kept on the root). */
+  private recomputeOffset(obj: SceneObject) {
+    this.tmpMatrix.compose(obj.root.position, obj.root.quaternion, ONE);
+    obj.offset.copy(obj.anchorMatrix).invert().multiply(this.tmpMatrix);
   }
 
   private isBeingManipulated(id: string): boolean {
@@ -548,9 +445,19 @@ export class ArEngine {
     return (g?.kind === 'drag' || g?.kind === 'two') && g.objectId === id;
   }
 
-  /** Mark an object as moved by the user so its anchor is recreated. */
+  /**
+   * Call after the user changes an object's pose. The new pose is stored
+   * relative to the existing anchor; a fresh anchor is made only when the
+   * object moved far from it.
+   */
   private touch(obj: SceneObject) {
-    obj.anchorDirty = true;
+    if (!obj.anchor || !obj.offsetValid) {
+      if (!obj.anchor && !obj.anchorPending) obj.needsAnchor = true;
+      return;
+    }
+    this.recomputeOffset(obj);
+    const offsetDistance = new THREE.Vector3().setFromMatrixPosition(obj.offset).length();
+    if (offsetDistance > REANCHOR_DISTANCE) obj.needsAnchor = true;
   }
 
   /** Keeps the lowest horizontal hit seen so floor objects spawn on the floor. */
@@ -583,9 +490,8 @@ export class ArEngine {
   }
 
   /**
-   * Tracking state with hysteresis: a good pose switches to "tracking" at
-   * once, but "limited" and "lost" only after the condition persists, so a
-   * brief dropout near a plain wall does not flash the status.
+   * Tracking status for the UI, with hysteresis so a brief dropout does not
+   * flash the label. (Rendering uses the raw per-frame pose, not this.)
    */
   private updateTracking(pose: XRViewerPose | null) {
     if (!pose) {
@@ -615,6 +521,11 @@ export class ArEngine {
   }
 
   // ----- Camera helpers -----
+
+  /** Editing maps the screen through the live camera, so it needs a pose. */
+  private get canEdit(): boolean {
+    return this.hasPose;
+  }
 
   /** World-space camera position and horizontal forward/right directions. */
   private cameraFrame(): { position: THREE.Vector3; forward: THREE.Vector3; right: THREE.Vector3 } | null {
@@ -686,7 +597,7 @@ export class ArEngine {
     root.position.copy(t.position);
     root.quaternion.copy(t.quaternion);
     root.scale.setScalar(t.scale);
-    this.world.add(root);
+    this.scene.add(root);
 
     const obj: SceneObject = {
       id: String(this.nextId++),
@@ -695,8 +606,12 @@ export class ArEngine {
       root,
       outline,
       anchor: null,
-      anchorDirty: true,
+      anchorMatrix: new THREE.Matrix4(),
+      offset: new THREE.Matrix4(),
+      offsetValid: false,
+      needsAnchor: true,
       anchorPending: false,
+      untrackedFrames: 0,
     };
     root.userData.objectId = obj.id;
     this.objects.push(obj);
@@ -821,7 +736,7 @@ export class ArEngine {
   }
 
   private removeObject(obj: SceneObject) {
-    this.world.remove(obj.root);
+    this.scene.remove(obj.root);
     obj.outline.geometry.dispose();
     obj.anchor?.delete();
     obj.anchor = null;
@@ -878,7 +793,7 @@ export class ArEngine {
    * One finger: tap an object to select it; drag a selected object to slide
    * it (floor objects on the floor plane, wall objects on a plane facing the
    * user). Tap empty space to deselect.
-   * Two fingers on a selected object: pinch to resize, twist to rotate,
+   * Two fingers, first one on the object: pinch to resize, twist to rotate,
    * move both fingers up/down to push the object away or pull it closer.
    */
   handleGesture(e: GestureEvent): void {
@@ -914,10 +829,8 @@ export class ArEngine {
 
     // up / cancel
     const wasTapEmpty = this.gesture?.kind === 'tap-empty' && !this.gesture.moved && e.type === 'up';
-    if (this.gesture?.kind === 'drag' || this.gesture?.kind === 'two') {
-      const obj = this.findObject(this.gesture.objectId);
-      if (obj) this.touch(obj);
-    }
+    const editedId =
+      this.gesture?.kind === 'drag' || this.gesture?.kind === 'two' ? this.gesture.objectId : null;
     this.pointers.delete(e.id);
     if (wasTapEmpty) this.select(null);
     if (this.pointers.size === 0) this.gesture = null;
@@ -925,6 +838,11 @@ export class ArEngine {
       // Lifted one of two fingers: stop the two-finger gesture, no new drag
       // until the remaining finger is lifted too.
       this.gesture = null;
+    }
+    // Store the new pose against the anchor once the gesture is over.
+    if (editedId && !this.isBeingManipulated(editedId)) {
+      const obj = this.findObject(editedId);
+      if (obj) this.touch(obj);
     }
   }
 
@@ -969,7 +887,7 @@ export class ArEngine {
 
   private pickObject(ray: THREE.Ray): SceneObject | null {
     this.raycaster.ray.copy(ray);
-    const roots = this.objects.map((o) => o.root);
+    const roots = this.objects.filter((o) => o.root.visible).map((o) => o.root);
     const hits = this.raycaster.intersectObjects(roots, true);
     for (const hit of hits) {
       let node: THREE.Object3D | null = hit.object;
@@ -1051,19 +969,14 @@ export class ArEngine {
     if (!g.twistOn && Math.abs(twist) > TWIST_START) g.twistOn = true;
     if (!g.pushOn && Math.abs(dy) > PUSH_START) g.pushOn = true;
 
-    // Pinch: size.
     if (g.scaleOn) {
       obj.root.scale.setScalar(THREE.MathUtils.clamp(g.startScale * ratio, MIN_SCALE, MAX_SCALE));
     }
-
-    // Twist: rotation about the vertical axis. Screen y points down, so a
-    // clockwise twist on screen is a negative angle change here.
+    // Screen y points down, so a clockwise twist on screen is a negative angle here.
     if (g.twistOn) {
       obj.root.quaternion.copy(g.startQuaternion);
       obj.root.rotateOnWorldAxis(UP, twist);
     }
-
-    // Both fingers up/down: push away / pull closer along the view direction.
     if (g.pushOn) {
       obj.root.position.copy(g.startPosition).addScaledVector(g.forward, -dy * PUSH_PER_SCREEN);
       this.clampPosition(obj);
@@ -1090,7 +1003,7 @@ export class ArEngine {
 
   private cleanupSession() {
     // Objects do not survive the session: their poses are relative to this
-    // session's tracking origin. Phase 6 adds export/import of the layout.
+    // session's tracking origin and anchors die with the session.
     for (const obj of [...this.objects]) this.removeObject(obj);
     this.selectedId = null;
     this.undoStack = [];
@@ -1100,17 +1013,8 @@ export class ArEngine {
     this.hitTestSource?.cancel();
     this.hitTestSource = null;
     this.floorY = null;
+    this.hasPose = false;
     this.scene.visible = true;
-
-    this.stopSensor();
-    this.calibrator.reset();
-    this.sensorState = 'off';
-    this.holding = false;
-    this.hasLastGood = false;
-    this.lastHadSensor = false;
-    this.noPoseFrames = 0;
-    this.world.matrix.identity();
-    this.world.matrixWorldNeedsUpdate = true;
 
     if (this.renderer) {
       this.renderer.setAnimationLoop(null);
