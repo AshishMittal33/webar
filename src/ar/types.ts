@@ -21,6 +21,7 @@ export type EngineEvent =
   | { type: 'started'; info: SessionInfo }
   | { type: 'tracking'; state: TrackingState }
   | { type: 'visibility'; state: XRVisibilityState }
+  | { type: 'fps'; fps: number }
   | { type: 'ended'; reason: 'user' | 'browser' }
   | { type: 'error'; error: ArError };
 

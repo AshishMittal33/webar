@@ -37,6 +37,10 @@ export class ArEngine {
   private testCube: THREE.Mesh | null = null;
   private testCubePlaced = false;
 
+  /** Frame counter for the FPS readout in the details panel. */
+  private frameCount = 0;
+  private fpsWindowStart = 0;
+
   constructor() {
     const hemi = new THREE.HemisphereLight(0xffffff, 0x667799, 1.0);
     const dir = new THREE.DirectionalLight(0xffffff, 0.8);
@@ -76,6 +80,8 @@ export class ArEngine {
     this.endedByUser = false;
     this.trackingState = 'initializing';
     this.testCubePlaced = false;
+    this.frameCount = 0;
+    this.fpsWindowStart = 0;
 
     let session: XRSession;
     try {
@@ -168,11 +174,24 @@ export class ArEngine {
     if (!renderer) return;
 
     if (frame) this.updateTracking(frame);
+    this.countFrame(_time);
 
     if (this.testCube) this.testCube.rotation.y += 0.01;
 
     renderer.render(this.scene, this.camera);
   };
+
+  private countFrame(time: number) {
+    this.frameCount += 1;
+    if (this.fpsWindowStart === 0) this.fpsWindowStart = time;
+    const elapsed = time - this.fpsWindowStart;
+    if (elapsed >= 1000) {
+      const fps = Math.round((this.frameCount * 1000) / elapsed);
+      this.frameCount = 0;
+      this.fpsWindowStart = time;
+      this.emit({ type: 'fps', fps });
+    }
+  }
 
   private updateTracking(frame: XRFrame) {
     const renderer = this.renderer!;

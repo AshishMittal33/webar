@@ -5,6 +5,8 @@ interface ArOverlayProps {
   tracking: TrackingState;
   info: SessionInfo | null;
   visibility: XRVisibilityState;
+  /** Rendered frames per second, updated once a second. 0 until measured. */
+  fps: number;
   onExit: () => void;
   /** True when rendered without a session, only to look at the UI. */
   previewMode?: boolean;
@@ -29,7 +31,14 @@ const TRACKING_GUIDE: Record<TrackingState, string> = {
  * Everything interactive calls preventDefault on "beforexrselect" so taps on
  * buttons never reach the XR session as placement taps (needed from Phase 3).
  */
-export default function ArOverlay({ tracking, info, visibility, onExit, previewMode }: ArOverlayProps) {
+export default function ArOverlay({
+  tracking,
+  info,
+  visibility,
+  fps,
+  onExit,
+  previewMode,
+}: ArOverlayProps) {
   const [showInfo, setShowInfo] = useState(false);
   const uiRef = useRef<HTMLDivElement>(null);
 
@@ -73,6 +82,8 @@ export default function ArOverlay({ tracking, info, visibility, onExit, previewM
               </div>
               <div className="hint">Blend mode: {info.environmentBlendMode}</div>
               <div className="hint">Reference space: {info.referenceSpace}</div>
+              <div className="hint">Render rate: {fps ? `${fps} fps` : 'measuring'}</div>
+              <div className="hint">Screen: {window.innerWidth}x{window.innerHeight} @ {window.devicePixelRatio}x</div>
             </>
           ) : (
             <div className="hint">Waiting for session to start.</div>

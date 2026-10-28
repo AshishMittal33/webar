@@ -23,6 +23,7 @@ export default function App() {
   const [tracking, setTracking] = useState<TrackingState>('initializing');
   const [info, setInfo] = useState<SessionInfo | null>(null);
   const [visibility, setVisibility] = useState<XRVisibilityState>('visible');
+  const [fps, setFps] = useState(0);
 
   useEffect(() => {
     return engine.subscribe((e) => {
@@ -37,6 +38,9 @@ export default function App() {
           break;
         case 'visibility':
           setVisibility(e.state);
+          break;
+        case 'fps':
+          setFps(e.fps);
           break;
         case 'ended':
           setScreen('landing');
@@ -93,6 +97,7 @@ export default function App() {
             tracking={tracking}
             info={info}
             visibility={visibility}
+            fps={fps}
             onExit={handleExit}
             previewMode={UI_PREVIEW}
           />,

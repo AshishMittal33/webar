@@ -240,7 +240,6 @@ ul.steps {
   padding: 8px 14px;
   border-radius: 999px;
   background: rgba(11, 15, 25, 0.7);
-  backdrop-filter: blur(8px);
   font-size: 0.9rem;
   font-weight: 600;
 }
@@ -254,7 +253,6 @@ ul.steps {
 
 .ar-status.initializing .dot {
   background: var(--warn);
-  animation: pulse 1s infinite alternate;
 }
 
 .ar-status.tracking .dot {
@@ -269,22 +267,12 @@ ul.steps {
   background: var(--err);
 }
 
-@keyframes pulse {
-  from {
-    opacity: 0.4;
-  }
-  to {
-    opacity: 1;
-  }
-}
-
 .ar-icon-btn {
   min-width: 44px;
   min-height: 44px;
   padding: 0;
   border-radius: 50%;
   background: rgba(11, 15, 25, 0.7);
-  backdrop-filter: blur(8px);
   font-weight: 700;
   font-family: Georgia, serif;
 }
@@ -293,7 +281,6 @@ ul.steps {
   min-height: 44px;
   padding: 0 16px;
   background: rgba(11, 15, 25, 0.7);
-  backdrop-filter: blur(8px);
   font-weight: 600;
 }
 
@@ -303,7 +290,6 @@ ul.steps {
   left: 12px;
   right: 12px;
   background: rgba(11, 15, 25, 0.85);
-  backdrop-filter: blur(8px);
   border-radius: var(--radius);
   padding: 14px;
   display: flex;
@@ -321,7 +307,6 @@ ul.steps {
 
 .ar-guide {
   background: rgba(11, 15, 25, 0.75);
-  backdrop-filter: blur(8px);
   border-radius: var(--radius);
   padding: 12px 16px;
   text-align: center;
