@@ -9,9 +9,9 @@ app, no paid SDKs, no backend.
 | Phase | Goal | State |
 | ----- | ---- | ----- |
 | 1 | React + TypeScript + Vite + Three.js project, landing screen, WebXR support check | Done |
-| 2 | Real immersive-ar session starts on an Android device | Built, awaiting phone test |
-| 3 | Hit-testing, place a single cube on the floor | Next |
-| 4 | Vertical wall placement investigation, single TV model | Pending |
+| 2 | Real immersive-ar session starts on an Android device | Done, verified on device |
+| 3 | Hit-testing, reticle, cubes placed on the floor with anchors | Built, awaiting phone test |
+| 4 | Vertical wall placement investigation, single TV model | Next |
 | 5 | Multi-object manager and touch manipulation | Pending |
 | 6 | Catalogue, error handling, performance, JSON export/import | Pending |
 | 7 | Free HTTPS deployment and QR code | Pending |
@@ -59,7 +59,7 @@ src/
   ar/
     support.ts        WebXR capability detection (no session started)
     types.ts          Tracking state, session info, error mapping
-    ArEngine.ts       WebXR session + Three.js renderer + render loop
+    ArEngine.ts       WebXR session, renderer, hit-test reticle, anchors, placement
   components/
     Landing.tsx       Start screen, device check, instructions
     ArOverlay.tsx     In-session UI (dom-overlay): status, details, Exit

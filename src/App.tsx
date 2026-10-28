@@ -1,13 +1,21 @@
 import { useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { ArEngine } from './ar/ArEngine';
-import { describeArError, type ArError, type SessionInfo, type TrackingState } from './ar/types';
+import {
+  describeArError,
+  type ArError,
+  type ReticleState,
+  type SessionInfo,
+  type TrackingState,
+} from './ar/types';
 import ArOverlay from './components/ArOverlay';
 import Landing from './components/Landing';
 
 type Screen = 'landing' | 'ar';
 
 const UI_PREVIEW = new URLSearchParams(window.location.search).get('ui') === 'preview';
+
+const NO_RETICLE: ReticleState = { visible: false, surface: null };
 
 export default function App() {
   const engineRef = useRef<ArEngine | null>(null);
@@ -20,10 +28,15 @@ export default function App() {
 
   const [screen, setScreen] = useState<Screen>(UI_PREVIEW ? 'ar' : 'landing');
   const [notice, setNotice] = useState<ArError | null>(null);
-  const [tracking, setTracking] = useState<TrackingState>('initializing');
+  const [tracking, setTracking] = useState<TrackingState>(UI_PREVIEW ? 'tracking' : 'initializing');
   const [info, setInfo] = useState<SessionInfo | null>(null);
   const [visibility, setVisibility] = useState<XRVisibilityState>('visible');
   const [fps, setFps] = useState(0);
+  const [reticle, setReticle] = useState<ReticleState>(
+    UI_PREVIEW ? { visible: true, surface: 'horizontal' } : NO_RETICLE,
+  );
+  const [objectCount, setObjectCount] = useState(0);
+  const [anchoredCount, setAnchoredCount] = useState(0);
 
   useEffect(() => {
     return engine.subscribe((e) => {
@@ -32,6 +45,9 @@ export default function App() {
           setInfo(e.info);
           setTracking('initializing');
           setVisibility('visible');
+          setReticle(NO_RETICLE);
+          setObjectCount(0);
+          setAnchoredCount(0);
           break;
         case 'tracking':
           setTracking(e.state);
@@ -42,9 +58,17 @@ export default function App() {
         case 'fps':
           setFps(e.fps);
           break;
+        case 'reticle':
+          setReticle(e.reticle);
+          break;
+        case 'objects':
+          setObjectCount(e.count);
+          setAnchoredCount(e.anchored);
+          break;
         case 'ended':
           setScreen('landing');
           setInfo(null);
+          setReticle(NO_RETICLE);
           if (e.reason === 'browser') {
             setNotice({
               code: 'SessionEnded',
@@ -81,6 +105,22 @@ export default function App() {
     void engine.end();
   };
 
+  const handlePlace = () => {
+    if (UI_PREVIEW) {
+      setObjectCount((c) => c + 1);
+      return;
+    }
+    engine.requestPlace();
+  };
+
+  const handleClear = () => {
+    if (UI_PREVIEW) {
+      setObjectCount(0);
+      return;
+    }
+    engine.clearObjects();
+  };
+
   return (
     <>
       {screen === 'landing' && <Landing onStart={handleStart} notice={notice} />}
@@ -98,6 +138,11 @@ export default function App() {
             info={info}
             visibility={visibility}
             fps={fps}
+            reticle={reticle}
+            objectCount={objectCount}
+            anchoredCount={anchoredCount}
+            onPlace={handlePlace}
+            onClear={handleClear}
             onExit={handleExit}
             previewMode={UI_PREVIEW}
           />,

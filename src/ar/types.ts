@@ -1,5 +1,16 @@
 export type TrackingState = 'initializing' | 'tracking' | 'limited' | 'lost';
 
+/**
+ * Rough classification of the surface under the reticle, derived from the
+ * hit-test pose normal. ARCore does not tell us "floor" or "wall" directly.
+ */
+export type SurfaceType = 'horizontal' | 'vertical' | 'other';
+
+export interface ReticleState {
+  visible: boolean;
+  surface: SurfaceType | null;
+}
+
 /** Facts about the running session, reported once it has started. */
 export interface SessionInfo {
   /** Features the browser actually granted (from XRSession.enabledFeatures). */
@@ -9,6 +20,8 @@ export interface SessionInfo {
   environmentBlendMode: string;
   referenceSpace: string;
   domOverlaySupported: boolean;
+  hitTestSupported: boolean;
+  anchorsSupported: boolean;
   /** WebXR framebuffer scale actually used (1 = native, 0.5 = quarter pixels). */
   renderScale: number;
 }
@@ -24,6 +37,8 @@ export type EngineEvent =
   | { type: 'tracking'; state: TrackingState }
   | { type: 'visibility'; state: XRVisibilityState }
   | { type: 'fps'; fps: number }
+  | { type: 'reticle'; reticle: ReticleState }
+  | { type: 'objects'; count: number; anchored: number }
   | { type: 'ended'; reason: 'user' | 'browser' }
   | { type: 'error'; error: ArError };
 

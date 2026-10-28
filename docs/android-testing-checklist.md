@@ -51,6 +51,30 @@ version and Chrome version with each result so problems can be traced.
       Block). The landing screen shows "Camera access was denied" with the
       instructions to re-enable it.
 
-## Phase 3 and later
+## Phase 3: hit-testing and floor placement
+
+- [ ] Start AR. Point the camera at the floor and move slowly. A green ring
+      (the reticle) appears on the floor within a few seconds.
+- [ ] Move the phone: the ring slides along the floor and stays flat on it.
+- [ ] Point at a wall. The ring should turn amber and the guide text should
+      say "Wall detected". Note whether this happens at all on your device:
+
+      Wall reticle appears: yes / no   Device: ______________
+
+- [ ] Point at the floor again and press "Place cube". A blue cube appears
+      sitting on the floor at the ring, not floating or sunk into it.
+- [ ] Tap anywhere on the empty camera view (not on a button). Another cube
+      appears at the ring. Tapping the "i" or "Exit AR" buttons must NOT
+      place a cube.
+- [ ] Place 3 or 4 cubes in different spots. Walk around the room and come
+      back. All cubes are still where you put them.
+- [ ] Open "i". "Anchors" should read "supported (N/N anchored)" with N equal
+      to the number of cubes. If it says 0 anchored, anchors are not working
+      on this device; cubes still work but may drift slightly.
+- [ ] Press "Clear". All cubes disappear and the counter resets.
+- [ ] Exit AR and Start again. The scene is empty (objects do not survive a
+      session; this is expected until save/restore in Phase 6).
+
+## Phase 4 and later
 
 Added when those phases are implemented.
