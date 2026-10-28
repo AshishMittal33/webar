@@ -6,9 +6,11 @@ interface LandingProps {
   onStart: () => void;
   /** Message from a previous attempt (permission denied, session ended...). */
   notice?: ArError | null;
+  useDepth: boolean;
+  onDepthChange: (value: boolean) => void;
 }
 
-export default function Landing({ onStart, notice }: LandingProps) {
+export default function Landing({ onStart, notice, useDepth, onDepthChange }: LandingProps) {
   const [report, setReport] = useState<SupportReport | null>(null);
   const [showDiag, setShowDiag] = useState(false);
 
@@ -78,6 +80,19 @@ export default function Landing({ onStart, notice }: LandingProps) {
           <li>Move your phone slowly to scan the floor and walls.</li>
           <li>Good lighting and textured surfaces help tracking.</li>
         </ul>
+      </section>
+
+      <section className="card">
+        <label className="toggle-row">
+          <input type="checkbox" checked={useDepth} onChange={(e) => onDepthChange(e.target.checked)} />
+          <span>
+            <strong>Depth wall assist (experimental)</strong>
+            <span className="hint">
+              Uses the phone's depth sensing to find walls automatically. Heavier on the device; on weaker
+              phones and tablets it can make tracking unstable. Leave off unless walls are not working.
+            </span>
+          </span>
+        </label>
       </section>
 
       <button className="btn-primary" disabled={!canStart} onClick={onStart}>

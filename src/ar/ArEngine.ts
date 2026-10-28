@@ -4,6 +4,7 @@ import {
   describeArError,
   type EngineEvent,
   type EngineListener,
+  type EngineStartOptions,
   type PlacementMode,
   type ReticleSource,
   type ReticleState,
@@ -11,20 +12,27 @@ import {
   type SurfaceType,
   type TrackingState,
   type WallMethod,
+  type WallSetupState,
 } from './types';
 
 /**
- * Features we ask the browser for. Only "local" tracking is required so the
- * session can start on every ARCore device; everything else is optional and
+ * Features we always ask for. Only "local" tracking is required so the
+ * session can start on every ARCore device; the rest are optional and are
  * reported back through SessionInfo so the UI can say what is really active.
+ * Depth sensing is added only when the user opts in: it costs real CPU on
+ * the device and made tracking worse on the first test tablet.
  */
-const OPTIONAL_FEATURES = ['dom-overlay', 'hit-test', 'anchors', 'light-estimation', 'depth-sensing'];
+const BASE_OPTIONAL_FEATURES = ['dom-overlay', 'hit-test', 'anchors'];
+const DEPTH_FEATURE = 'depth-sensing';
 
 /** Pixel budget per AR frame, roughly 1080p. Above this we scale down. */
 const TARGET_PIXELS = 2_000_000;
 
-/** Floor-edge fallback: height of the TV mounting point above the floor. */
+/** Height of the TV mounting point above the floor for wall-line placement. */
 const WALL_TV_HEIGHT = 1.2;
+
+/** Two wall points closer than this are too close to define a direction. */
+const WALL_MIN_SPAN = 0.3;
 
 /** Depth estimates outside this range are treated as "no wall here". */
 const DEPTH_MIN = 0.3;
@@ -34,22 +42,18 @@ const DEPTH_MAX = 8;
 const LIMITED_AFTER_FRAMES = 20;
 const LOST_AFTER_FRAMES = 45;
 
-/**
- * Depth samples across the screen centre line, as normalized x positions.
- * Several points let us fit the wall's direction instead of assuming it
- * faces the user.
- */
+/** Depth samples across the screen centre line, as normalized x positions. */
 const DEPTH_SAMPLE_XS = [0.3, 0.4, 0.5, 0.6, 0.7];
-/** Max distance of a sample from the fitted wall line to accept the fit. */
 const WALL_FIT_TOLERANCE = 0.06;
-/** Minimum horizontal spread of samples for a meaningful direction. */
 const WALL_FIT_MIN_SPAN = 0.2;
+
 /** Reticle smoothing factor per frame (0 = frozen, 1 = raw). */
 const RETICLE_SMOOTHING = 0.25;
 /** A jump larger than this resets smoothing (user aimed somewhere else). */
 const RETICLE_RESET_DISTANCE = 0.3;
 
 const UP = new THREE.Vector3(0, 1, 0);
+const ONE = new THREE.Vector3(1, 1, 1);
 
 /**
  * Chooses the WebXR framebuffer scale for this screen: 1.0 on phones with
@@ -105,6 +109,13 @@ interface Target {
   hit: XRHitTestResult | null;
 }
 
+/** A wall defined by the user: a point on its base line, its direction, and its normal. */
+interface WallLine {
+  point: THREE.Vector3;
+  dir: THREE.Vector3;
+  normal: THREE.Vector3;
+}
+
 // Parts of the WebXR API that @types/webxr may not declare on this version.
 type AnchorCapableHit = XRHitTestResult & { createAnchor?: () => Promise<XRAnchor> };
 type AnchorCapableFrame = XRFrame & {
@@ -136,6 +147,7 @@ export class ArEngine {
   private listeners = new Set<EngineListener>();
   private trackingState: TrackingState = 'initializing';
   private endedByUser = false;
+  private requestedFeatures: string[] = BASE_OPTIONAL_FEATURES;
 
   private frameCount = 0;
   private fpsWindowStart = 0;
@@ -151,10 +163,26 @@ export class ArEngine {
   // Reticle
   private readonly reticle: THREE.Group;
   private readonly reticleRing: THREE.Mesh;
-  private reticleState: ReticleState = { visible: false, surface: null, source: null };
+  private reticleState: ReticleState = { visible: false, surface: null, source: null, distance: null };
   private target: Target | null = null;
   /** Lowest floor height seen from hit-testing this session, if any. */
   private floorY: number | null = null;
+
+  // Manual wall definition
+  private wallFirstPoint: THREE.Vector3 | null = null;
+  private wallLine: WallLine | null = null;
+  private wallSetup: WallSetupState = 'none';
+  private readonly wallMarkers = new THREE.Group();
+  private readonly markerGeometry = new THREE.SphereGeometry(0.02, 12, 8);
+  private readonly markerMaterial = new THREE.MeshBasicMaterial({ color: 0xf5b942 });
+  private readonly wallPlaneMaterial = new THREE.MeshBasicMaterial({
+    color: 0x4f8cff,
+    transparent: true,
+    opacity: 0.12,
+    side: THREE.DoubleSide,
+    depthWrite: false,
+  });
+  private readonly wallBaseMaterial = new THREE.MeshBasicMaterial({ color: 0x4f8cff });
 
   // Placement
   private placeRequested = false;
@@ -184,7 +212,7 @@ export class ArEngine {
     this.reticle.matrixAutoUpdate = false;
     this.reticle.visible = false;
     this.reticleRing = ring;
-    this.scene.add(this.reticle);
+    this.scene.add(this.reticle, this.wallMarkers);
   }
 
   subscribe(listener: EngineListener): () => void {
@@ -205,21 +233,27 @@ export class ArEngine {
    * only allows requestSession with transient user activation, so nothing
    * here awaits before requestSession is invoked.
    */
-  async start(canvasHost: HTMLElement, overlayRoot: HTMLElement): Promise<void> {
+  async start(canvasHost: HTMLElement, overlayRoot: HTMLElement, options: EngineStartOptions): Promise<void> {
     if (this.session) throw new DOMException('Session already running', 'InvalidStateError');
     const xr = navigator.xr;
     if (!xr) throw new DOMException('WebXR not available', 'NotSupportedError');
 
+    this.requestedFeatures = options.useDepth
+      ? [...BASE_OPTIONAL_FEATURES, DEPTH_FEATURE]
+      : [...BASE_OPTIONAL_FEATURES];
+
     const init: XRSessionInit & { depthSensing?: unknown } = {
       requiredFeatures: ['local'],
-      optionalFeatures: OPTIONAL_FEATURES,
+      optionalFeatures: this.requestedFeatures,
       domOverlay: { root: overlayRoot },
-      // CPU access is required to read a single depth value at the centre.
-      depthSensing: {
+    };
+    if (options.useDepth) {
+      // CPU access is required to read depth values at chosen pixels.
+      init.depthSensing = {
         usagePreference: ['cpu-optimized'],
         dataFormatPreference: ['luminance-alpha', 'float32'],
-      },
-    };
+      };
+    }
     const sessionPromise = xr.requestSession('immersive-ar', init);
 
     this.endedByUser = false;
@@ -262,6 +296,7 @@ export class ArEngine {
 
     renderer.setAnimationLoop(this.onFrame);
     this.emit({ type: 'started', info });
+    this.emit({ type: 'wall', state: this.wallSetup });
   }
 
   /** Ends the session. Resolves after cleanup; safe to call twice. */
@@ -279,9 +314,17 @@ export class ArEngine {
     this.mode = mode;
   }
 
-  /** Ask to place an object at the reticle on the next frame. */
+  /** Ask to place (or set a wall point) at the reticle on the next frame. */
   requestPlace(): void {
     this.placeRequested = true;
+  }
+
+  /** Forget the user-defined wall so a new one can be set. */
+  resetWall(): void {
+    this.wallFirstPoint = null;
+    this.wallLine = null;
+    this.clearWallMarkers();
+    this.setWallSetup('none');
   }
 
   /** Remove every placed object and its anchor. */
@@ -316,8 +359,9 @@ export class ArEngine {
   private collectSessionInfo(session: XRSession, renderScale: number): SessionInfo {
     const s = session as DepthCapableSession;
     const enabled = s.enabledFeatures ?? ['(enabledFeatures not reported by this browser)'];
-    const missing = OPTIONAL_FEATURES.filter((f) => !enabled.includes(f));
-    const depthCpu = enabled.includes('depth-sensing') && (s.depthUsage === undefined || s.depthUsage === 'cpu-optimized');
+    const missing = this.requestedFeatures.filter((f) => !enabled.includes(f));
+    const depthCpu =
+      enabled.includes(DEPTH_FEATURE) && (s.depthUsage === undefined || s.depthUsage === 'cpu-optimized');
     return {
       enabledFeatures: enabled,
       missingFeatures: missing,
@@ -374,8 +418,8 @@ export class ArEngine {
    *
    * floor mode: first hit-test result (green when horizontal).
    * wall mode:  1. a vertical hit-test result (real wall detection)
-   *             2. else a depth-sensing estimate at the screen centre
-   *             3. else a horizontal hit, for the floor-edge fallback
+   *             2. else a depth-sensing estimate, if the user enabled depth
+   *             3. else a horizontal hit, used to define or snap to the wall line
    */
   private updateTarget(frame: XRFrame, refSpace: XRReferenceSpace, viewerPose: XRViewerPose | null) {
     let hitTarget: Target | null = null;
@@ -402,13 +446,13 @@ export class ArEngine {
     }
 
     let target: Target | null = hitTarget;
-    if (this.mode === 'wall' && (!hitTarget || hitTarget.surface !== 'vertical')) {
+    if (this.mode === 'wall' && this.depthAvailable && (!hitTarget || hitTarget.surface !== 'vertical')) {
       const depthTarget = viewerPose ? this.estimateWallFromDepth(frame, viewerPose) : null;
       if (depthTarget) target = depthTarget;
     }
 
     this.target = this.smoothTarget(target);
-    this.applyReticle(this.target);
+    this.applyReticle(this.target, viewerPose);
   }
 
   /** Grabs CPU depth info for this frame, or null. Disables depth on failure. */
@@ -442,7 +486,6 @@ export class ArEngine {
       return null;
     }
     if (!Number.isFinite(meters) || meters < DEPTH_MIN || meters > DEPTH_MAX) return null;
-    // Point on the view ray in camera space, then scaled to the sampled depth.
     const p = new THREE.Vector3(2 * x - 1, 1 - 2 * y, 0.5).applyMatrix4(invProjection);
     if (p.z >= 0) return null;
     p.multiplyScalar(meters / -p.z);
@@ -467,7 +510,6 @@ export class ArEngine {
     }
     if (pts.length < 3) return null;
 
-    // 2D principal direction in the XZ (floor) plane.
     let mx = 0;
     let mz = 0;
     for (const p of pts) {
@@ -503,17 +545,11 @@ export class ArEngine {
     if (maxT - minT < WALL_FIT_MIN_SPAN) return null;
 
     const normal = new THREE.Vector3(perp.x, 0, perp.y).normalize();
-    // Face the camera.
     if (normal.dot(new THREE.Vector3(camPos.x - mx, 0, camPos.z - mz)) < 0) normal.negate();
     return normal;
   }
 
-  /**
-   * Estimates a wall under the screen centre from depth sensing. Checks that
-   * the surface is upright (not the floor) and fits its direction from
-   * several samples so the TV lies flat on the wall whatever the viewing
-   * angle. Falls back to "facing the user" when the fit is unreliable.
-   */
+  /** Estimates a wall under the screen centre from depth sensing (opt-in). */
   private estimateWallFromDepth(frame: XRFrame, viewerPose: XRViewerPose): Target | null {
     const view = viewerPose.views[0];
     if (!view) return null;
@@ -527,12 +563,8 @@ export class ArEngine {
 
     const center = this.unprojectDepth(depth, 0.5, 0.5, invProjection, viewToWorld);
     if (!center) return null;
-
-    // Reject the floor: anything close to the known floor height is not a wall.
     if (this.floorY !== null && center.y < this.floorY + 0.25) return null;
 
-    // Reject non-upright surfaces: points above and below the centre must be
-    // stacked vertically, not spread out in depth like a floor or table.
     const top = this.unprojectDepth(depth, 0.5, 0.35, invProjection, viewToWorld);
     const bottom = this.unprojectDepth(depth, 0.5, 0.65, invProjection, viewToWorld);
     if (top && bottom) {
@@ -550,21 +582,9 @@ export class ArEngine {
     return { position: center, normal, surface: 'vertical', source: 'depth', hit: null };
   }
 
-  /** Wall direction from depth for the floor-edge fallback, if measurable. */
-  private wallNormalFromDepth(frame: XRFrame, viewerPose: XRViewerPose): THREE.Vector3 | null {
-    const view = viewerPose.views[0];
-    if (!view) return null;
-    const depth = this.getDepth(frame, view);
-    if (!depth) return null;
-    const invProjection = new THREE.Matrix4().fromArray(view.projectionMatrix).invert();
-    const viewToWorld = new THREE.Matrix4().fromArray(view.transform.matrix);
-    const t = viewerPose.transform.position;
-    return this.fitWallNormal(depth, invProjection, viewToWorld, new THREE.Vector3(t.x, t.y, t.z));
-  }
-
   /**
    * Blends the new target into the previous one so the reticle, and the
-   * pose used for placement, do not jitter with per-frame depth noise.
+   * pose used for placement, do not jitter with per-frame noise.
    */
   private smoothTarget(next: Target | null): Target | null {
     const prev = this.target;
@@ -583,33 +603,49 @@ export class ArEngine {
     return next;
   }
 
-  private applyReticle(target: Target | null) {
-    let next: ReticleState = { visible: false, surface: null, source: null };
+  private applyReticle(target: Target | null, viewerPose: XRViewerPose | null) {
+    let next: ReticleState = { visible: false, surface: null, source: null, distance: null };
     if (target) {
-      const q = quatWithUpAxis(target.normal);
-      this.reticle.matrix.compose(target.position, q, new THREE.Vector3(1, 1, 1));
-      next = { visible: true, surface: target.surface, source: target.source };
+      let position = target.position;
+      let normal = target.normal;
+      // With a defined wall, show the reticle snapped onto the wall base line
+      // so the user sees exactly where the TV will go.
+      if (this.mode === 'wall' && this.wallLine && target.surface === 'horizontal') {
+        position = this.projectOntoWallLine(target.position);
+        normal = this.wallLine.normal;
+      }
+      this.reticle.matrix.compose(position, quatWithUpAxis(normal), ONE);
+      let distance: number | null = null;
+      if (viewerPose) {
+        const t = viewerPose.transform.position;
+        distance = Math.round(position.distanceTo(new THREE.Vector3(t.x, t.y, t.z)) * 100) / 100;
+      }
+      next = { visible: true, surface: target.surface, source: target.source, distance };
     }
     this.reticle.visible = next.visible;
 
     const changed =
       next.visible !== this.reticleState.visible ||
       next.surface !== this.reticleState.surface ||
-      next.source !== this.reticleState.source;
+      next.source !== this.reticleState.source ||
+      // Distance only matters for the "too close" hint; report coarse changes.
+      Math.abs((next.distance ?? 0) - (this.reticleState.distance ?? 0)) > 0.1;
     if (!changed) return;
 
     this.reticleState = next;
     const mat = this.reticleRing.material as THREE.MeshBasicMaterial;
     const placeable = this.isPlaceable(next);
-    // Green: ready. Blue: depth estimate. Amber: not the surface this mode wants.
-    mat.color.setHex(next.source === 'depth' ? 0x4f8cff : placeable ? 0x37c978 : 0xf5b942);
+    // Green: ready. Blue: depth estimate. Amber: setting up / wrong surface.
+    const colour =
+      next.source === 'depth' ? 0x4f8cff : placeable && (this.mode === 'floor' || this.wallLine || next.surface === 'vertical') ? 0x37c978 : 0xf5b942;
+    mat.color.setHex(colour);
     this.emit({ type: 'reticle', reticle: next });
   }
 
   private isPlaceable(r: ReticleState): boolean {
     if (!r.visible) return false;
     if (this.mode === 'floor') return r.surface === 'horizontal' && r.source === 'hit';
-    // Wall mode accepts a wall (real or estimated) or the floor-edge fallback.
+    // Wall mode accepts a wall (real or estimated) or a floor hit (wall line).
     return r.surface === 'vertical' || r.surface === 'horizontal';
   }
 
@@ -620,55 +656,132 @@ export class ArEngine {
     if (this.mode === 'floor') {
       const root = new THREE.Group();
       root.matrixAutoUpdate = false;
-      root.matrix.compose(target.position, quatWithUpAxis(target.normal), new THREE.Vector3(1, 1, 1));
+      root.matrix.compose(target.position, quatWithUpAxis(target.normal), ONE);
       root.add(createCube());
-      this.addPlaced({ root, anchor: null, kind: 'cube', wallMethod: null });
-      this.anchorToHit(target.hit, this.placed[this.placed.length - 1]);
+      const obj: PlacedObject = { root, anchor: null, kind: 'cube', wallMethod: null };
+      this.addPlaced(obj);
+      this.anchorToHit(target.hit, obj);
       return;
     }
 
-    // Wall mode: work out the mounting pose and how we got it.
+    // Wall mode.
     let position: THREE.Vector3;
     let normal: THREE.Vector3;
     let method: WallMethod;
+
     if (target.surface === 'vertical') {
       position = target.position.clone();
       normal = target.normal.clone();
       method = target.source === 'hit' ? 'wall-hit' : 'depth';
     } else {
-      // Floor-edge fallback: the reticle is on the floor where it meets the
-      // wall. Mount the TV above that point. Use the wall direction from
-      // depth when it can be measured, otherwise face the user.
-      const fitted = this.wallNormalFromDepth(frame, viewerPose);
-      if (fitted) {
-        normal = fitted;
-      } else {
-        const t = viewerPose.transform.position;
-        normal = new THREE.Vector3(t.x - target.position.x, 0, t.z - target.position.z);
-        if (normal.lengthSq() < 1e-4) return;
-        normal.normalize();
+      // Floor hit: either we are still defining the wall, or we snap to it.
+      if (!this.wallLine) {
+        this.addWallPoint(target.position.clone(), viewerPose);
+        return;
       }
-      position = target.position.clone().add(new THREE.Vector3(0, WALL_TV_HEIGHT, 0));
-      method = 'floor-edge';
+      position = this.projectOntoWallLine(target.position).add(new THREE.Vector3(0, WALL_TV_HEIGHT, 0));
+      normal = this.wallLine.normal.clone();
+      method = 'wall-line';
     }
 
     const quat = quatFacing(normal);
     const root = new THREE.Group();
     root.matrixAutoUpdate = false;
-    root.matrix.compose(position, quat, new THREE.Vector3(1, 1, 1));
+    root.matrix.compose(position, quat, ONE);
     root.add(createTv());
     const obj: PlacedObject = { root, anchor: null, kind: 'tv', wallMethod: method };
     this.lastWallMethod = method;
     this.addPlaced(obj);
 
     if (method === 'wall-hit') {
-      // A plane-attached anchor: the TV follows ARCore's refinements of the wall.
-      // Its pose is the hit pose, so re-express the TV pose relative to it.
       this.anchorToHit(target.hit, obj, { position, quat });
     } else {
       this.anchorToPose(frame, refSpace, obj, position, quat);
     }
   }
+
+  // ----- Manual wall line -----
+
+  private addWallPoint(point: THREE.Vector3, viewerPose: XRViewerPose) {
+    if (!this.wallFirstPoint) {
+      this.wallFirstPoint = point;
+      this.addMarker(point);
+      this.setWallSetup('first-point');
+      return;
+    }
+
+    const a = this.wallFirstPoint;
+    const dir = new THREE.Vector3(point.x - a.x, 0, point.z - a.z);
+    if (dir.length() < WALL_MIN_SPAN) {
+      // Too close to the first point to know the wall direction; ignore.
+      return;
+    }
+    dir.normalize();
+    // Normal perpendicular to the base line, pointing toward the user.
+    const normal = new THREE.Vector3(-dir.z, 0, dir.x);
+    const cam = viewerPose.transform.position;
+    const toCam = new THREE.Vector3(cam.x - a.x, 0, cam.z - a.z);
+    if (normal.dot(toCam) < 0) normal.negate();
+
+    const base = new THREE.Vector3(a.x, Math.min(a.y, point.y), a.z);
+    this.wallLine = { point: base, dir, normal };
+    this.wallFirstPoint = null;
+    this.addMarker(point);
+    this.addWallVisual(base, point, dir, normal);
+    this.setWallSetup('defined');
+  }
+
+  /** Foot of the perpendicular from `p` to the wall base line (in XZ). */
+  private projectOntoWallLine(p: THREE.Vector3): THREE.Vector3 {
+    const w = this.wallLine!;
+    const rel = new THREE.Vector3(p.x - w.point.x, 0, p.z - w.point.z);
+    const t = rel.dot(w.dir);
+    return new THREE.Vector3(w.point.x + w.dir.x * t, w.point.y, w.point.z + w.dir.z * t);
+  }
+
+  private addMarker(point: THREE.Vector3) {
+    const m = new THREE.Mesh(this.markerGeometry, this.markerMaterial);
+    m.position.copy(point);
+    this.wallMarkers.add(m);
+  }
+
+  /** Faint translucent wall and a base line so the user can judge alignment. */
+  private addWallVisual(a: THREE.Vector3, b: THREE.Vector3, dir: THREE.Vector3, normal: THREE.Vector3) {
+    const span = Math.max(3, a.distanceTo(b) + 1.5);
+    const height = 2.4;
+    const mid = a.clone().add(b).multiplyScalar(0.5);
+    mid.y = a.y;
+    const quat = quatFacing(normal);
+
+    const base = new THREE.Mesh(new THREE.BoxGeometry(span, 0.01, 0.01), this.wallBaseMaterial);
+    base.position.copy(mid);
+    base.quaternion.copy(quat);
+
+    const plane = new THREE.Mesh(new THREE.PlaneGeometry(span, height), this.wallPlaneMaterial);
+    plane.position.copy(mid).add(new THREE.Vector3(0, height / 2, 0));
+    plane.quaternion.copy(quat);
+    plane.renderOrder = -1;
+
+    this.wallMarkers.add(base, plane);
+    void dir;
+  }
+
+  private clearWallMarkers() {
+    for (const child of [...this.wallMarkers.children]) {
+      this.wallMarkers.remove(child);
+      const mesh = child as THREE.Mesh;
+      // Shared marker geometry/material stay; per-wall visuals are disposed.
+      if (mesh.geometry !== this.markerGeometry) mesh.geometry.dispose();
+    }
+  }
+
+  private setWallSetup(state: WallSetupState) {
+    if (state === this.wallSetup) return;
+    this.wallSetup = state;
+    this.emit({ type: 'wall', state });
+  }
+
+  // ----- Objects and anchors -----
 
   private addPlaced(obj: PlacedObject) {
     this.scene.add(obj.root);
@@ -690,10 +803,8 @@ export class ArEngine {
     if (!this.anchorsAvailable || !anchorable || typeof anchorable.createAnchor !== 'function') return;
 
     if (desired) {
-      // root will follow the anchor (hit pose); put the model under an inner
-      // group carrying the offset from hit pose to desired pose.
       const hitPose = new THREE.Matrix4().copy(obj.root.matrix);
-      const desiredM = new THREE.Matrix4().compose(desired.position, desired.quat, new THREE.Vector3(1, 1, 1));
+      const desiredM = new THREE.Matrix4().compose(desired.position, desired.quat, ONE);
       const offset = new THREE.Matrix4().copy(hitPose).invert().multiply(desiredM);
       const inner = new THREE.Group();
       inner.matrixAutoUpdate = false;
@@ -710,7 +821,7 @@ export class ArEngine {
       });
   }
 
-  /** Anchors `obj` at an arbitrary pose (depth or floor-edge placements). */
+  /** Anchors `obj` at an arbitrary pose (depth or wall-line placements). */
   private anchorToPose(
     frame: XRFrame,
     refSpace: XRReferenceSpace,
@@ -841,12 +952,17 @@ export class ArEngine {
     this.placed = [];
     this.lastWallMethod = null;
 
+    this.wallFirstPoint = null;
+    this.wallLine = null;
+    this.clearWallMarkers();
+    this.wallSetup = 'none';
+
     this.hitTestSource?.cancel();
     this.hitTestSource = null;
     this.target = null;
     this.floorY = null;
     this.reticle.visible = false;
-    this.reticleState = { visible: false, surface: null, source: null };
+    this.reticleState = { visible: false, surface: null, source: null, distance: null };
 
     if (this.renderer) {
       this.renderer.setAnimationLoop(null);

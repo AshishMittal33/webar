@@ -83,14 +83,19 @@ desktop. It is clearly labelled and starts no AR session.
   when ARCore has detected a vertical plane, which needs a textured wall and
   time; plain painted walls are often never detected. On the first test
   device the floor was detected within seconds and the wall never was.
-  Wall mode therefore uses, in order:
+  Tracking the camera close to a plain wall is also unreliable on every
+  device, because ARCore has no visual features to lock onto. Wall mode
+  therefore uses, in order:
   1. A real vertical hit-test result when one exists (green ring).
-  2. The WebXR depth-sensing API, reading the distance at the screen centre
-     and assuming a vertical wall facing the user (blue ring, labelled
-     "estimated"). Only on devices that grant `depth-sensing`.
-  3. A clearly labelled manual fallback: aim at the floor where it meets the
-     wall; the TV is mounted 1.2 m above that point facing the user (amber
-     ring). Phase 5 adds move and rotate controls to fine-tune it.
+  2. The WebXR depth-sensing API, only when the user turns on "Depth wall
+     assist" on the start screen. Several depth samples are fitted to find
+     the wall direction (blue ring, labelled "estimated"). Depth costs real
+     CPU and made tracking worse on the first test tablet, so it is off by
+     default.
+  3. The main method, which needs only the floor: two taps along the line
+     where the wall meets the floor define the wall. A faint translucent wall
+     is drawn, and every TV then snaps flat onto it 1.2 m above the floor.
+     Users stand back from the wall, where tracking is stable.
   The method used is always shown in the guide text and the "i" panel.
 - Exported JSON stores virtual coordinates relative to the AR session origin.
   Re-importing in a new session does not restore objects to the same

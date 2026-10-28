@@ -20,10 +20,28 @@ export interface ReticleState {
   visible: boolean;
   surface: SurfaceType | null;
   source: ReticleSource | null;
+  /** Distance from the camera to the reticle in metres, when visible. */
+  distance: number | null;
 }
 
-/** How a wall object ended up where it is. Shown to the user, never hidden. */
-export type WallMethod = 'wall-hit' | 'depth' | 'floor-edge';
+/**
+ * How a wall object ended up where it is. Shown to the user, never hidden.
+ * - wall-hit:  real vertical plane from hit-testing
+ * - depth:     depth-sensing estimate (optional, off by default)
+ * - wall-line: the wall the user defined with two floor taps
+ */
+export type WallMethod = 'wall-hit' | 'depth' | 'wall-line';
+
+/**
+ * Manual wall definition progress. Two taps along the line where the wall
+ * meets the floor define the wall; afterwards TVs snap onto it.
+ */
+export type WallSetupState = 'none' | 'first-point' | 'defined';
+
+export interface EngineStartOptions {
+  /** Request ARCore depth sensing. Heavier on the device; off by default. */
+  useDepth: boolean;
+}
 
 /** Facts about the running session, reported once it has started. */
 export interface SessionInfo {
@@ -56,6 +74,7 @@ export type EngineEvent =
   | { type: 'reticle'; reticle: ReticleState }
   | { type: 'objects'; count: number; anchored: number; lastWallMethod: WallMethod | null }
   | { type: 'depth'; available: boolean }
+  | { type: 'wall'; state: WallSetupState }
   | { type: 'ended'; reason: 'user' | 'browser' }
   | { type: 'error'; error: ArError };
 

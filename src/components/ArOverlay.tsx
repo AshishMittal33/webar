@@ -1,5 +1,12 @@
 import { useEffect, useRef, useState } from 'react';
-import type { PlacementMode, ReticleState, SessionInfo, TrackingState, WallMethod } from '../ar/types';
+import type {
+  PlacementMode,
+  ReticleState,
+  SessionInfo,
+  TrackingState,
+  WallMethod,
+  WallSetupState,
+} from '../ar/types';
 
 interface ArOverlayProps {
   tracking: TrackingState;
@@ -10,11 +17,13 @@ interface ArOverlayProps {
   mode: PlacementMode;
   reticle: ReticleState;
   depthAvailable: boolean;
+  wallSetup: WallSetupState;
   objectCount: number;
   anchoredCount: number;
   lastWallMethod: WallMethod | null;
   onModeChange: (mode: PlacementMode) => void;
   onPlace: () => void;
+  onResetWall: () => void;
   onClear: () => void;
   onExit: () => void;
   /** True when rendered without a session, only to look at the UI. */
@@ -31,16 +40,27 @@ const TRACKING_LABEL: Record<TrackingState, string> = {
 const WALL_METHOD_LABEL: Record<WallMethod, string> = {
   'wall-hit': 'detected wall',
   depth: 'depth estimate',
-  'floor-edge': 'floor-edge manual placement',
+  'wall-line': 'wall set by two floor points',
 };
 
-function guidance(mode: PlacementMode, tracking: TrackingState, r: ReticleState, hitTest: boolean): string {
-  if (tracking === 'initializing') return 'Move your phone slowly to scan the area.';
+/** Closer than this to the target, ARCore tends to lose its features. */
+const TOO_CLOSE = 0.7;
+
+function guidance(
+  mode: PlacementMode,
+  tracking: TrackingState,
+  r: ReticleState,
+  wall: WallSetupState,
+  hitTest: boolean,
+): string {
+  if (tracking === 'initializing') return 'Move your phone slowly over the floor to scan the area.';
   if (tracking === 'lost')
-    return 'Tracking lost. Step back from plain surfaces, point at furniture or the floor, and move slowly.';
+    return 'Tracking lost. Step back, point at the floor or furniture, and move slowly until it recovers.';
   if (tracking === 'limited')
-    return 'Tracking is limited, usually from being too close to a plain wall. Step back a little and move slowly.';
+    return 'Tracking is limited, usually from being too close to a plain wall. Step back and keep some floor in view.';
   if (!hitTest) return 'This device did not grant hit-testing, so surfaces cannot be detected.';
+  if (r.visible && r.distance !== null && r.distance < TOO_CLOSE)
+    return 'Too close. Step back a little so the camera can keep tracking.';
 
   if (mode === 'floor') {
     if (!r.visible) return 'Aim at the floor to place furniture. If nothing appears, move slowly or try another angle.';
@@ -49,20 +69,33 @@ function guidance(mode: PlacementMode, tracking: TrackingState, r: ReticleState,
     return 'Sloped surface. Aim at a flat floor to place.';
   }
 
-  // wall mode
-  if (!r.visible) return 'Aim at the wall to position a TV. If nothing appears, aim at the bottom of the wall where it meets the floor.';
-  if (r.surface === 'vertical' && r.source === 'hit') return 'Wall detected. Tap the screen or press Place to mount the TV.';
-  if (r.surface === 'vertical' && r.source === 'depth')
+  // Wall mode.
+  if (r.visible && r.surface === 'vertical' && r.source === 'hit')
+    return 'Wall detected. Tap the screen or press Place to mount the TV.';
+  if (r.visible && r.surface === 'vertical' && r.source === 'depth')
     return 'Wall estimated from depth. Hold still for a second, then press Place.';
-  if (r.surface === 'horizontal')
-    return 'No wall detected. Manual mode: aim at the line where the wall meets the floor and press Place. The TV is mounted 1.2 m above that point.';
-  return 'Aim at a flat wall.';
+
+  if (wall === 'none')
+    return 'Stand 2 m back. Aim at the line where the wall meets the floor and press "Set wall point 1".';
+  if (wall === 'first-point')
+    return 'Now aim further along the same wall base, at least half a metre away, and press "Set wall point 2".';
+  if (!r.visible) return 'Wall is set. Aim at the floor near the wall to position the TV.';
+  if (r.surface === 'horizontal') return 'Aim at the floor below where you want the TV, then press Place TV. It snaps onto the wall.';
+  return 'Aim at the floor near the wall.';
 }
 
 function canPlace(mode: PlacementMode, r: ReticleState): boolean {
   if (!r.visible) return false;
   if (mode === 'floor') return r.surface === 'horizontal' && r.source === 'hit';
   return r.surface === 'vertical' || r.surface === 'horizontal';
+}
+
+function placeLabel(mode: PlacementMode, r: ReticleState, wall: WallSetupState): string {
+  if (mode === 'floor') return 'Place cube';
+  if (r.visible && r.surface === 'vertical') return 'Place TV';
+  if (wall === 'none') return 'Set wall point 1';
+  if (wall === 'first-point') return 'Set wall point 2';
+  return 'Place TV';
 }
 
 /**
@@ -78,11 +111,13 @@ export default function ArOverlay({
   mode,
   reticle,
   depthAvailable,
+  wallSetup,
   objectCount,
   anchoredCount,
   lastWallMethod,
   onModeChange,
   onPlace,
+  onResetWall,
   onClear,
   onExit,
   previewMode,
@@ -134,10 +169,14 @@ export default function ArOverlay({
               <div className="hint">
                 Anchors: {info.anchorsSupported ? `supported (${anchoredCount}/${objectCount} anchored)` : 'unavailable'}
               </div>
-              <div className="hint">Depth sensing: {depthAvailable ? 'active' : 'unavailable'}</div>
+              <div className="hint">Depth sensing: {depthAvailable ? 'active' : 'off'}</div>
               <div className="hint">
-                Reticle: {reticle.visible ? `${reticle.surface} via ${reticle.source}` : 'none'}
+                Reticle:{' '}
+                {reticle.visible
+                  ? `${reticle.surface} via ${reticle.source}${reticle.distance !== null ? `, ${reticle.distance} m` : ''}`
+                  : 'none'}
               </div>
+              <div className="hint">Wall setup: {wallSetup}</div>
               <div className="hint">
                 Last wall placement: {lastWallMethod ? WALL_METHOD_LABEL[lastWallMethod] : 'none yet'}
               </div>
@@ -156,7 +195,7 @@ export default function ArOverlay({
 
       <footer className="ar-bottom">
         <div className="ar-guide">
-          {paused ? 'AR is paused. Return to this tab to continue.' : guidance(mode, tracking, reticle, hitTest)}
+          {paused ? 'AR is paused. Return to this tab to continue.' : guidance(mode, tracking, reticle, wallSetup, hitTest)}
         </div>
         <div className="ar-mode" role="radiogroup" aria-label="Placement mode">
           <button
@@ -182,8 +221,13 @@ export default function ArOverlay({
               Clear ({objectCount})
             </button>
           )}
+          {mode === 'wall' && wallSetup !== 'none' && (
+            <button className="ar-secondary" onClick={onResetWall}>
+              Reset wall
+            </button>
+          )}
           <button className="ar-place" disabled={!placeable} onClick={onPlace}>
-            {mode === 'floor' ? 'Place cube' : 'Place TV'}
+            {placeLabel(mode, reticle, wallSetup)}
           </button>
         </div>
       </footer>

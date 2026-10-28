@@ -9,6 +9,7 @@ import {
   type SessionInfo,
   type TrackingState,
   type WallMethod,
+  type WallSetupState,
 } from './ar/types';
 import ArOverlay from './components/ArOverlay';
 import Landing from './components/Landing';
@@ -17,7 +18,17 @@ type Screen = 'landing' | 'ar';
 
 const UI_PREVIEW = new URLSearchParams(window.location.search).get('ui') === 'preview';
 
-const NO_RETICLE: ReticleState = { visible: false, surface: null, source: null };
+const NO_RETICLE: ReticleState = { visible: false, surface: null, source: null, distance: null };
+
+const DEPTH_PREF_KEY = 'webar.useDepth';
+
+function readDepthPref(): boolean {
+  try {
+    return localStorage.getItem(DEPTH_PREF_KEY) === '1';
+  } catch {
+    return false;
+  }
+}
 
 export default function App() {
   const engineRef = useRef<ArEngine | null>(null);
@@ -30,15 +41,17 @@ export default function App() {
 
   const [screen, setScreen] = useState<Screen>(UI_PREVIEW ? 'ar' : 'landing');
   const [notice, setNotice] = useState<ArError | null>(null);
+  const [useDepth, setUseDepth] = useState<boolean>(readDepthPref);
   const [tracking, setTracking] = useState<TrackingState>(UI_PREVIEW ? 'tracking' : 'initializing');
   const [info, setInfo] = useState<SessionInfo | null>(null);
   const [visibility, setVisibility] = useState<XRVisibilityState>('visible');
   const [fps, setFps] = useState(0);
   const [mode, setMode] = useState<PlacementMode>('floor');
   const [reticle, setReticle] = useState<ReticleState>(
-    UI_PREVIEW ? { visible: true, surface: 'horizontal', source: 'hit' } : NO_RETICLE,
+    UI_PREVIEW ? { visible: true, surface: 'horizontal', source: 'hit', distance: 1.5 } : NO_RETICLE,
   );
   const [depthAvailable, setDepthAvailable] = useState(false);
+  const [wallSetup, setWallSetup] = useState<WallSetupState>('none');
   const [objectCount, setObjectCount] = useState(0);
   const [anchoredCount, setAnchoredCount] = useState(0);
   const [lastWallMethod, setLastWallMethod] = useState<WallMethod | null>(null);
@@ -71,6 +84,9 @@ export default function App() {
         case 'depth':
           setDepthAvailable(e.available);
           break;
+        case 'wall':
+          setWallSetup(e.state);
+          break;
         case 'objects':
           setObjectCount(e.count);
           setAnchoredCount(e.anchored);
@@ -80,6 +96,7 @@ export default function App() {
           setScreen('landing');
           setInfo(null);
           setReticle(NO_RETICLE);
+          setWallSetup('none');
           if (e.reason === 'browser') {
             setNotice({
               code: 'SessionEnded',
@@ -96,13 +113,22 @@ export default function App() {
     });
   }, [engine]);
 
+  const handleDepthChange = (value: boolean) => {
+    setUseDepth(value);
+    try {
+      localStorage.setItem(DEPTH_PREF_KEY, value ? '1' : '0');
+    } catch {
+      // Private mode or storage blocked: the choice just lasts this visit.
+    }
+  };
+
   // Called synchronously from the Start button tap so user activation is kept.
   const handleStart = () => {
     if (!canvasHost.current || !overlayRoot) return;
     setNotice(null);
     setScreen('ar');
     engine.setMode(mode);
-    engine.start(canvasHost.current, overlayRoot).catch((err) => {
+    engine.start(canvasHost.current, overlayRoot, { useDepth }).catch((err) => {
       // 'error' event already carried the friendly message; this is a safety net.
       setNotice(describeArError(err));
       setScreen('landing');
@@ -121,17 +147,29 @@ export default function App() {
     setMode(next);
     engine.setMode(next);
     if (UI_PREVIEW) {
-      setReticle({ visible: true, surface: next === 'floor' ? 'horizontal' : 'vertical', source: 'hit' });
+      setReticle({ visible: true, surface: 'horizontal', source: 'hit', distance: 1.5 });
     }
   };
 
   const handlePlace = () => {
     if (UI_PREVIEW) {
-      setObjectCount((c) => c + 1);
-      if (mode === 'wall') setLastWallMethod('wall-hit');
+      if (mode === 'wall' && wallSetup === 'none') setWallSetup('first-point');
+      else if (mode === 'wall' && wallSetup === 'first-point') setWallSetup('defined');
+      else {
+        setObjectCount((c) => c + 1);
+        if (mode === 'wall') setLastWallMethod('wall-line');
+      }
       return;
     }
     engine.requestPlace();
+  };
+
+  const handleResetWall = () => {
+    if (UI_PREVIEW) {
+      setWallSetup('none');
+      return;
+    }
+    engine.resetWall();
   };
 
   const handleClear = () => {
@@ -145,7 +183,9 @@ export default function App() {
 
   return (
     <>
-      {screen === 'landing' && <Landing onStart={handleStart} notice={notice} />}
+      {screen === 'landing' && (
+        <Landing onStart={handleStart} notice={notice} useDepth={useDepth} onDepthChange={handleDepthChange} />
+      )}
 
       {/* Always mounted so the engine can attach a canvas and the overlay root
           exists before requestSession is called. */}
@@ -163,11 +203,13 @@ export default function App() {
             mode={mode}
             reticle={reticle}
             depthAvailable={depthAvailable}
+            wallSetup={wallSetup}
             objectCount={objectCount}
             anchoredCount={anchoredCount}
             lastWallMethod={lastWallMethod}
             onModeChange={handleModeChange}
             onPlace={handlePlace}
+            onResetWall={handleResetWall}
             onClear={handleClear}
             onExit={handleExit}
             previewMode={UI_PREVIEW}

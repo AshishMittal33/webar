@@ -77,28 +77,40 @@ version and Chrome version with each result so problems can be traced.
 
 ## Phase 4: wall placement (TV)
 
-Wall detection is not guaranteed on Android. The app tries three methods and
-always says which one is active in the guide text and in the "i" panel.
+Wall detection is not guaranteed on Android, and tracking the camera close
+to a plain wall is unreliable on every device. The main wall method therefore
+only needs the floor: two taps along the line where the wall meets the floor
+define the wall, and TVs snap onto it.
 
-- [ ] Start AR, scan the floor until tracking is green, then tap "Wall (TV)".
-- [ ] Aim at a wall with some texture (poster, switch plate, door frame) and
-      hold still for 10 to 20 seconds. If a green ring appears flat on the
-      wall and the guide says "Wall detected", automatic wall detection works
-      on this device. Record it:
+- [ ] Start AR with "Depth wall assist" OFF (the default). Scan the floor
+      until tracking is green, then tap "Wall (TV)".
+- [ ] Stand about 2 m from the wall. Aim the ring at the line where the wall
+      meets the floor and press "Set wall point 1". An amber dot appears.
+- [ ] Move the aim at least half a metre along the same wall base and press
+      "Set wall point 2". A faint blue transparent wall and a base line
+      appear. Check they line up with the real wall. If not, press
+      "Reset wall" and set the two points again.
+- [ ] Aim at the floor below where you want the TV and press "Place TV".
+      The TV appears on the wall 1.2 m up, flat against it.
+- [ ] Place three TVs side by side. Walk to the side: all three are flat on
+      the wall and in a straight line.
+- [ ] Walk toward a TV. Tracking may say Limited when the camera sees only
+      plain wall; the message tells you to step back. TVs must not jump when
+      tracking recovers (small corrections are normal).
+- [ ] Open "i": read "Wall setup", "Last wall placement" and "Anchors".
+- [ ] Optional, textured wall: aim at it for 10 to 20 seconds. If a GREEN
+      ring appears flat on the wall with "Wall detected", automatic wall
+      detection works on this device. Record it:
 
       Automatic wall detection: yes / no   Device: ______________
 
-- [ ] If instead a BLUE ring appears with "Wall estimated from depth", depth
-      sensing is active. Press "Place TV". The TV should appear flat against
-      the wall, facing you, roughly where the ring was.
-- [ ] If an AMBER ring appears only when aiming at the floor and the guide
-      says "No wall detected. Manual mode", use the floor-edge method: aim at
-      the line where the wall meets the floor and press "Place TV". The TV
-      is mounted 1.2 m above that point, facing you.
-- [ ] Place three TVs side by side on the same wall. Walk to the side and
-      check they are flat against the wall, not floating in the room or
-      sunk into it. Small errors are expected with depth and floor-edge.
-- [ ] Open "i": read "Depth sensing", "Last wall placement" and "Anchors".
+- [ ] Optional, depth assist: exit, turn ON "Depth wall assist" on the start
+      screen, start again, aim at the wall. A BLUE ring means depth is
+      active. Check whether tracking stays stable; if it gets worse, leave
+      the option off on this device and note it here:
+
+      Depth assist usable: yes / no
+
 - [ ] Switch back to "Floor" and place a cube on the floor in the same
       session. TVs and cube all stay in place.
 
