@@ -38,6 +38,11 @@ const TRACKING_LABEL: Record<TrackingState, string> = {
   lost: 'Lost',
 };
 
+/** Fraction of screen width at each side where gripping thumbs rest. */
+const GRIP_EDGE = 0.1;
+/** Contact size in CSS px above which a touch is treated as a palm. */
+const PALM_SIZE_PX = 60;
+
 /** Step sizes for the precise buttons. */
 const STEP_M = 0.05;
 const STEP_DEG = 10;
@@ -50,7 +55,7 @@ function guidance(tracking: TrackingState, hasObjects: boolean, hasSelection: bo
   if (tracking === 'limited') return 'Tracking is limited. Step back and keep some floor or furniture in view.';
   if (!hasObjects) return 'Tap + TV or + Box to add an object in front of you.';
   if (!hasSelection) return 'Tap an object to select it.';
-  return 'Drag to move. Pinch to resize. Twist two fingers to rotate. Two fingers up/down to push or pull.';
+  return 'Put a finger on the object and drag. Add a second finger to pinch, twist or push. Tap Done to lock it.';
 }
 
 /**
@@ -102,8 +107,25 @@ export default function ArOverlay({
   const selected = objects.find((o) => o.id === selectedId) ?? null;
   const selectedIndex = selected ? objects.indexOf(selected) + 1 : 0;
 
+  // Touches from the hands holding the device: thumbs resting near the left
+  // and right edges, or a palm (large contact area). These are dropped so
+  // walking around with the tablet in both hands never moves an object.
+  const ignoredPointers = useRef(new Set<number>());
+
   const gesture = (type: GestureEvent['type']) => (e: ReactPointerEvent<HTMLDivElement>) => {
-    if (type === 'down') e.currentTarget.setPointerCapture(e.pointerId);
+    if (type === 'down') {
+      const w = window.innerWidth;
+      const inGripZone = e.clientX < w * GRIP_EDGE || e.clientX > w * (1 - GRIP_EDGE);
+      const isPalm = e.pointerType === 'touch' && Math.max(e.width, e.height) > PALM_SIZE_PX;
+      if (inGripZone || isPalm) {
+        ignoredPointers.current.add(e.pointerId);
+        return;
+      }
+      e.currentTarget.setPointerCapture(e.pointerId);
+    } else if (ignoredPointers.current.has(e.pointerId)) {
+      if (type === 'up' || type === 'cancel') ignoredPointers.current.delete(e.pointerId);
+      return;
+    }
     onGesture({ type, id: e.pointerId, x: e.clientX / window.innerWidth, y: e.clientY / window.innerHeight });
   };
 

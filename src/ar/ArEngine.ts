@@ -48,6 +48,14 @@ const TAP_SLOP = 0.01;
 /** Two-finger vertical drag: metres of push/pull per full screen height. */
 const PUSH_PER_SCREEN = 2.5;
 
+/** Two-finger thresholds before each component starts acting. */
+const PINCH_START = 0.08;
+const TWIST_START = THREE.MathUtils.degToRad(6);
+const PUSH_START = 0.04;
+
+/** Frames without a camera pose before objects are hidden (about 0.2 s). */
+const HIDE_AFTER_NO_POSE_FRAMES = 12;
+
 const UNDO_LIMIT = 30;
 
 const UP = new THREE.Vector3(0, 1, 0);
@@ -131,6 +139,10 @@ type Gesture =
       startQuaternion: THREE.Quaternion;
       startPosition: THREE.Vector3;
       forward: THREE.Vector3;
+      /** Each component switches on only once its movement passes a threshold. */
+      scaleOn: boolean;
+      twistOn: boolean;
+      pushOn: boolean;
     }
   | { kind: 'tap-empty'; pointerId: number; startX: number; startY: number; moved: boolean };
 
@@ -157,6 +169,7 @@ export class ArEngine {
   private statsEnabled = false;
   private lostFrames = 0;
   private limitedFrames = 0;
+  private noPoseFrames = 0;
 
   private hitTestSource: XRHitTestSource | null = null;
   private floorY: number | null = null;
@@ -316,8 +329,10 @@ export class ArEngine {
       const viewerPose = (refSpace ? frame.getViewerPose(refSpace) : null) ?? null;
       this.updateTracking(viewerPose);
       // No pose means ARCore has lost tracking. Drawing objects with a stale
-      // camera makes them look glued to the screen, so draw nothing instead.
-      this.scene.visible = viewerPose !== null;
+      // camera makes them look glued to the screen, so hide them, but only
+      // after a short grace period so brief dropouts do not flicker.
+      this.noPoseFrames = viewerPose ? 0 : this.noPoseFrames + 1;
+      this.scene.visible = this.noPoseFrames < HIDE_AFTER_NO_POSE_FRAMES;
       if (refSpace) {
         this.learnFloor(frame, refSpace);
         this.updateAnchors(frame, refSpace);
@@ -730,8 +745,15 @@ export class ArEngine {
 
     if (e.type === 'down') {
       this.pointers.set(e.id, { x: e.x, y: e.y });
-      if (this.pointers.size === 1) this.beginOneFinger(e);
-      else if (this.pointers.size === 2) this.beginTwoFinger();
+      if (this.pointers.size === 1) {
+        this.beginOneFinger(e);
+      } else if (this.pointers.size === 2) {
+        // A two-finger gesture only counts when the first finger landed on
+        // the object. Two touches on empty space (hands holding the
+        // device) do nothing, and must not deselect either.
+        if (this.gesture?.kind === 'drag') this.beginTwoFinger();
+        else if (this.gesture?.kind === 'tap-empty') this.gesture.moved = true;
+      }
       return;
     }
 
@@ -862,6 +884,9 @@ export class ArEngine {
       startQuaternion: obj.root.quaternion.clone(),
       startPosition: obj.root.position.clone(),
       forward: cam.forward.clone(),
+      scaleOn: false,
+      twistOn: false,
+      pushOn: false,
     };
   }
 
@@ -872,20 +897,33 @@ export class ArEngine {
     const stats = this.twoFingerStats();
     if (!obj || !stats) return;
 
+    // Each component only activates after a clear, deliberate movement, so a
+    // twist does not also resize the object and a pinch does not also push it.
+    const ratio = stats.distance / g.startDistance;
+    const angleDelta = stats.angle - g.startAngle;
+    const twist = -Math.atan2(Math.sin(angleDelta), Math.cos(angleDelta));
+    const dy = stats.midY - g.startMidY;
+    if (!g.scaleOn && Math.abs(ratio - 1) > PINCH_START) g.scaleOn = true;
+    if (!g.twistOn && Math.abs(twist) > TWIST_START) g.twistOn = true;
+    if (!g.pushOn && Math.abs(dy) > PUSH_START) g.pushOn = true;
+
     // Pinch: size.
-    const s = THREE.MathUtils.clamp(g.startScale * (stats.distance / g.startDistance), MIN_SCALE, MAX_SCALE);
-    obj.root.scale.setScalar(s);
+    if (g.scaleOn) {
+      obj.root.scale.setScalar(THREE.MathUtils.clamp(g.startScale * ratio, MIN_SCALE, MAX_SCALE));
+    }
 
     // Twist: rotation about the vertical axis. Screen y points down, so a
     // clockwise twist on screen is a negative angle change here.
-    const twist = -(stats.angle - g.startAngle);
-    obj.root.quaternion.copy(g.startQuaternion);
-    obj.root.rotateOnWorldAxis(UP, twist);
+    if (g.twistOn) {
+      obj.root.quaternion.copy(g.startQuaternion);
+      obj.root.rotateOnWorldAxis(UP, twist);
+    }
 
     // Both fingers up/down: push away / pull closer along the view direction.
-    const push = -(stats.midY - g.startMidY) * PUSH_PER_SCREEN;
-    obj.root.position.copy(g.startPosition).addScaledVector(g.forward, push);
-    this.clampPosition(obj);
+    if (g.pushOn) {
+      obj.root.position.copy(g.startPosition).addScaledVector(g.forward, -dy * PUSH_PER_SCREEN);
+      this.clampPosition(obj);
+    }
   }
 
   // ----- Session end -----
