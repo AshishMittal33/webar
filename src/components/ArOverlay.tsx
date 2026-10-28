@@ -46,7 +46,7 @@ const STEP_SCALE = 1.1;
 function guidance(tracking: TrackingState, hasObjects: boolean, hasSelection: boolean): string {
   if (tracking === 'initializing') return 'Move your phone slowly over the floor to scan the area.';
   if (tracking === 'lost')
-    return 'Tracking lost: the camera sees only plain surfaces. Tilt down so the floor is in view and move slowly.';
+    return 'Tracking lost, objects hidden. Point at the floor or furniture and move slowly; they come back in place.';
   if (tracking === 'limited') return 'Tracking is limited. Step back and keep some floor or furniture in view.';
   if (!hasObjects) return 'Tap + TV or + Box to add an object in front of you.';
   if (!hasSelection) return 'Tap an object to select it.';
@@ -145,6 +145,7 @@ export default function ArOverlay({
               </div>
               <div className="hint">Floor height: {floorKnown ? 'known' : 'not yet (boxes spawn 1.4 m below eye)'}</div>
               <div className="hint">Objects: {objects.length}</div>
+              <div className="hint">Anchors: {info.anchorsSupported ? 'supported' : 'unavailable'}</div>
               <div className="hint">Blend mode: {info.environmentBlendMode}</div>
               <div className="hint">Render rate: {fps ? `${fps} fps` : 'measuring'}</div>
               <div className="hint">Render scale: {info.renderScale}</div>

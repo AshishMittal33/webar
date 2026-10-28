@@ -17,7 +17,15 @@ import {
  * walls or anchors are involved in placement; objects are fixed in the
  * session's local space and only move when the user moves them.
  */
-const OPTIONAL_FEATURES = ['dom-overlay', 'hit-test'];
+const OPTIONAL_FEATURES = ['dom-overlay', 'hit-test', 'anchors'];
+
+/** Anchor corrections below these are ignored as tracking noise. */
+const ANCHOR_DEADBAND_M = 0.008;
+const ANCHOR_DEADBAND_RAD = THREE.MathUtils.degToRad(0.75);
+/** Per-frame blend toward the anchor pose for corrections above the deadband. */
+const ANCHOR_SMOOTHING = 0.08;
+/** A correction this large is a relocalisation; apply it at once. */
+const ANCHOR_SNAP_M = 0.3;
 
 /** Pixel budget per AR frame, roughly 1080p. Above this we scale down. */
 const TARGET_PIXELS = 2_000_000;
@@ -79,7 +87,15 @@ interface SceneObject {
   spawn: 'floor' | 'eye';
   root: THREE.Group;
   outline: THREE.LineSegments;
+  anchor: XRAnchor | null;
+  /** True when the user moved it and the anchor must be recreated. */
+  anchorDirty: boolean;
+  anchorPending: boolean;
 }
+
+type AnchorCapableFrame = XRFrame & {
+  createAnchor?: (pose: XRRigidTransform, space: XRSpace) => Promise<XRAnchor>;
+};
 
 interface Transform {
   position: THREE.Vector3;
@@ -144,6 +160,7 @@ export class ArEngine {
 
   private hitTestSource: XRHitTestSource | null = null;
   private floorY: number | null = null;
+  private anchorsAvailable = false;
 
   private objects: SceneObject[] = [];
   private selectedId: string | null = null;
@@ -221,6 +238,7 @@ export class ArEngine {
     await renderer.xr.setSession(session);
 
     const info = this.collectSessionInfo(session, renderScale);
+    this.anchorsAvailable = info.anchorsSupported;
     await this.setupHitTest(session, info);
 
     renderer.setAnimationLoop(this.onFrame);
@@ -271,6 +289,7 @@ export class ArEngine {
       referenceSpace: 'local',
       domOverlaySupported: enabled.includes('dom-overlay'),
       hitTestSupported: enabled.includes('hit-test') && typeof session.requestHitTestSource === 'function',
+      anchorsSupported: enabled.includes('anchors'),
       renderScale,
     };
   }
@@ -296,12 +315,88 @@ export class ArEngine {
       const refSpace = renderer.xr.getReferenceSpace();
       const viewerPose = (refSpace ? frame.getViewerPose(refSpace) : null) ?? null;
       this.updateTracking(viewerPose);
-      if (refSpace) this.learnFloor(frame, refSpace);
+      // No pose means ARCore has lost tracking. Drawing objects with a stale
+      // camera makes them look glued to the screen, so draw nothing instead.
+      this.scene.visible = viewerPose !== null;
+      if (refSpace) {
+        this.learnFloor(frame, refSpace);
+        this.updateAnchors(frame, refSpace);
+      }
     }
     this.countFrame(time);
 
     renderer.render(this.scene, this.camera);
   };
+
+  // ----- Anchors -----
+
+  /**
+   * Anchors exist for one reason here: after tracking is lost and found
+   * again, ARCore moves anchors back to the right real-world spot, while a
+   * static pose would be left wherever the relocalised origin put it.
+   * To stop anchors from making objects shiver, corrections below a
+   * deadband are ignored, larger ones ease in, and nothing is applied while
+   * tracking is degraded or the object is being dragged.
+   */
+  private updateAnchors(frame: XRFrame, refSpace: XRReferenceSpace) {
+    if (!this.anchorsAvailable) return;
+    const f = frame as AnchorCapableFrame;
+
+    for (const obj of this.objects) {
+      if (obj.anchorDirty && !obj.anchorPending && typeof f.createAnchor === 'function') {
+        obj.anchorDirty = false;
+        obj.anchorPending = true;
+        const old = obj.anchor;
+        obj.anchor = null;
+        old?.delete();
+        const p = obj.root.position;
+        const q = obj.root.quaternion;
+        try {
+          f.createAnchor(new XRRigidTransform({ x: p.x, y: p.y, z: p.z, w: 1 }, { x: q.x, y: q.y, z: q.z, w: q.w }), refSpace)
+            .then((anchor) => {
+              obj.anchorPending = false;
+              if (!this.objects.includes(obj) || obj.anchorDirty) {
+                anchor.delete();
+                return;
+              }
+              obj.anchor = anchor;
+            })
+            .catch(() => {
+              obj.anchorPending = false;
+            });
+        } catch {
+          obj.anchorPending = false;
+        }
+        continue;
+      }
+
+      if (!obj.anchor || this.trackingState !== 'tracking' || this.isBeingManipulated(obj.id)) continue;
+      const pose = frame.getPose(obj.anchor.anchorSpace, refSpace);
+      if (!pose) continue;
+
+      const p = pose.transform.position;
+      const q = pose.transform.orientation;
+      const anchorPos = new THREE.Vector3(p.x, p.y, p.z);
+      const anchorQuat = new THREE.Quaternion(q.x, q.y, q.z, q.w);
+      const moved = obj.root.position.distanceTo(anchorPos);
+      const turned = obj.root.quaternion.angleTo(anchorQuat);
+      if (moved < ANCHOR_DEADBAND_M && turned < ANCHOR_DEADBAND_RAD) continue;
+
+      const t = moved > ANCHOR_SNAP_M ? 1 : ANCHOR_SMOOTHING;
+      obj.root.position.lerp(anchorPos, t);
+      obj.root.quaternion.slerp(anchorQuat, t);
+    }
+  }
+
+  private isBeingManipulated(id: string): boolean {
+    const g = this.gesture;
+    return (g?.kind === 'drag' || g?.kind === 'two') && g.objectId === id;
+  }
+
+  /** Mark an object as moved by the user so its anchor is recreated. */
+  private touch(obj: SceneObject) {
+    obj.anchorDirty = true;
+  }
 
   /** Keeps the lowest horizontal hit seen so floor objects spawn on the floor. */
   private learnFloor(frame: XRFrame, refSpace: XRReferenceSpace) {
@@ -437,7 +532,16 @@ export class ArEngine {
     root.scale.setScalar(t.scale);
     this.scene.add(root);
 
-    const obj: SceneObject = { id: String(this.nextId++), kind, spawn: spec.spawn, root, outline };
+    const obj: SceneObject = {
+      id: String(this.nextId++),
+      kind,
+      spawn: spec.spawn,
+      root,
+      outline,
+      anchor: null,
+      anchorDirty: true,
+      anchorPending: false,
+    };
     root.userData.objectId = obj.id;
     this.objects.push(obj);
     return obj;
@@ -472,6 +576,7 @@ export class ArEngine {
     obj.root.position.copy(t.position);
     obj.root.quaternion.copy(t.quaternion);
     obj.root.scale.setScalar(t.scale);
+    this.touch(obj);
   }
 
   private clampPosition(obj: SceneObject) {
@@ -494,6 +599,7 @@ export class ArEngine {
     this.pushUndo({ type: 'transform', id: obj.id, before: this.snapshot(obj) });
     obj.root.position.addScaledVector(cam.right, dx).addScaledVector(UP, dy).addScaledVector(cam.forward, dz);
     this.clampPosition(obj);
+    this.touch(obj);
   }
 
   /** Rotates the selected object around its vertical axis by degrees. */
@@ -502,6 +608,7 @@ export class ArEngine {
     if (!obj) return;
     this.pushUndo({ type: 'transform', id: obj.id, before: this.snapshot(obj) });
     obj.root.rotateOnWorldAxis(UP, THREE.MathUtils.degToRad(degrees));
+    this.touch(obj);
   }
 
   /** Turns the selected object to face the user squarely. */
@@ -512,6 +619,7 @@ export class ArEngine {
     this.pushUndo({ type: 'transform', id: obj.id, before: this.snapshot(obj) });
     const toCam = cam.position.clone().sub(obj.root.position);
     obj.root.quaternion.copy(quatFacing(toCam));
+    this.touch(obj);
   }
 
   /** Multiplies the selected object's size. */
@@ -559,6 +667,8 @@ export class ArEngine {
   private removeObject(obj: SceneObject) {
     this.scene.remove(obj.root);
     obj.outline.geometry.dispose();
+    obj.anchor?.delete();
+    obj.anchor = null;
     this.objects = this.objects.filter((o) => o !== obj);
   }
 
@@ -638,6 +748,10 @@ export class ArEngine {
 
     // up / cancel
     const wasTapEmpty = this.gesture?.kind === 'tap-empty' && !this.gesture.moved && e.type === 'up';
+    if (this.gesture?.kind === 'drag' || this.gesture?.kind === 'two') {
+      const obj = this.findObject(this.gesture.objectId);
+      if (obj) this.touch(obj);
+    }
     this.pointers.delete(e.id);
     if (wasTapEmpty) this.select(null);
     if (this.pointers.size === 0) this.gesture = null;
@@ -804,6 +918,7 @@ export class ArEngine {
     this.hitTestSource?.cancel();
     this.hitTestSource = null;
     this.floorY = null;
+    this.scene.visible = true;
 
     if (this.renderer) {
       this.renderer.setAnimationLoop(null);

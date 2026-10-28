@@ -20,6 +20,8 @@ export interface SessionInfo {
   domOverlaySupported: boolean;
   /** Hit-testing is used only to learn the floor height for spawning. */
   hitTestSupported: boolean;
+  /** Anchors re-attach objects to the room after tracking is lost and found. */
+  anchorsSupported: boolean;
   /** WebXR framebuffer scale actually used (1 = native, 0.5 = quarter pixels). */
   renderScale: number;
 }
