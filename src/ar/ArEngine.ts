@@ -34,6 +34,9 @@ const WALL_TV_HEIGHT = 1.2;
 /** Two wall points closer than this are too close to define a direction. */
 const WALL_MIN_SPAN = 0.3;
 
+/** Closer than this to the target, ARCore tends to lose its features. */
+const TOO_CLOSE_M = 0.7;
+
 /** Depth estimates outside this range are treated as "no wall here". */
 const DEPTH_MIN = 0.3;
 const DEPTH_MAX = 8;
@@ -46,6 +49,14 @@ const LOST_AFTER_FRAMES = 45;
 const DEPTH_SAMPLE_XS = [0.3, 0.4, 0.5, 0.6, 0.7];
 const WALL_FIT_TOLERANCE = 0.06;
 const WALL_FIT_MIN_SPAN = 0.2;
+
+/** Anchor corrections below these are ignored as tracking noise. */
+const ANCHOR_DEADBAND_M = 0.005;
+const ANCHOR_DEADBAND_RAD = THREE.MathUtils.degToRad(0.5);
+/** Per-frame blend toward the anchor pose for corrections above the deadband. */
+const ANCHOR_SMOOTHING = 0.1;
+/** A correction this large is a relocalisation; apply it at once. */
+const ANCHOR_SNAP_M = 0.25;
 
 /** Reticle smoothing factor per frame (0 = frozen, 1 = raw). */
 const RETICLE_SMOOTHING = 0.25;
@@ -156,6 +167,7 @@ export class ArEngine {
 
   private frameCount = 0;
   private fpsWindowStart = 0;
+  private statsEnabled = false;
   private lostFrames = 0;
   private limitedFrames = 0;
 
@@ -625,7 +637,10 @@ export class ArEngine {
       let distance: number | null = null;
       if (viewerPose) {
         const t = viewerPose.transform.position;
-        distance = Math.round(position.distanceTo(new THREE.Vector3(t.x, t.y, t.z)) * 100) / 100;
+        const raw = position.distanceTo(new THREE.Vector3(t.x, t.y, t.z));
+        // Coarse buckets: the UI only needs "too close" and a rough readout,
+        // and every reported change re-renders the DOM overlay.
+        distance = raw < TOO_CLOSE_M ? Math.round(raw * 10) / 10 : Math.round(raw * 2) / 2;
       }
       next = { visible: true, surface: target.surface, source: target.source, distance };
     }
@@ -635,8 +650,7 @@ export class ArEngine {
       next.visible !== this.reticleState.visible ||
       next.surface !== this.reticleState.surface ||
       next.source !== this.reticleState.source ||
-      // Distance only matters for the "too close" hint; report coarse changes.
-      Math.abs((next.distance ?? 0) - (this.reticleState.distance ?? 0)) > 0.1;
+      next.distance !== this.reticleState.distance;
     if (!changed) return;
 
     this.reticleState = next;
@@ -871,13 +885,41 @@ export class ArEngine {
     this.emitObjects();
   }
 
+  /**
+   * Follows each object's anchor, but calmly: corrections smaller than the
+   * deadband are ignored (they are tracking noise, and applying them makes
+   * objects shiver), larger ones are blended in over several frames, and
+   * nothing moves while tracking is not solid. If an anchor is momentarily
+   * untracked the object keeps its last pose rather than vanishing.
+   */
   private updateAnchoredObjects(frame: XRFrame, refSpace: XRReferenceSpace) {
+    if (this.trackingState !== 'tracking') return;
+    const anchorPos = new THREE.Vector3();
+    const anchorQuat = new THREE.Quaternion();
+    const curPos = new THREE.Vector3();
+    const curQuat = new THREE.Quaternion();
+    const scale = new THREE.Vector3();
+
     for (const obj of this.placed) {
       if (!obj.anchor) continue;
       const pose = frame.getPose(obj.anchor.anchorSpace, refSpace);
-      // If the anchor is momentarily untracked we keep the last pose rather
-      // than hiding the object: flicker is worse than a brief drift.
-      if (pose) obj.root.matrix.fromArray(pose.transform.matrix);
+      if (!pose) continue;
+
+      const p = pose.transform.position;
+      const q = pose.transform.orientation;
+      anchorPos.set(p.x, p.y, p.z);
+      anchorQuat.set(q.x, q.y, q.z, q.w);
+      obj.root.matrix.decompose(curPos, curQuat, scale);
+
+      const moved = curPos.distanceTo(anchorPos);
+      const turned = curQuat.angleTo(anchorQuat);
+      if (moved < ANCHOR_DEADBAND_M && turned < ANCHOR_DEADBAND_RAD) continue;
+
+      // Large jumps (relocalisation) snap; small corrections ease in.
+      const t = moved > ANCHOR_SNAP_M ? 1 : ANCHOR_SMOOTHING;
+      curPos.lerp(anchorPos, t);
+      curQuat.slerp(anchorQuat, t);
+      obj.root.matrix.compose(curPos, curQuat, ONE);
     }
   }
 
@@ -896,7 +938,15 @@ export class ArEngine {
     this.placeRequested = true;
   };
 
+  /** Turn the once-a-second fps report on or off (it re-renders the overlay). */
+  setStatsEnabled(enabled: boolean): void {
+    this.statsEnabled = enabled;
+    this.frameCount = 0;
+    this.fpsWindowStart = 0;
+  }
+
   private countFrame(time: number) {
+    if (!this.statsEnabled) return;
     this.frameCount += 1;
     if (this.fpsWindowStart === 0) this.fpsWindowStart = time;
     const elapsed = time - this.fpsWindowStart;

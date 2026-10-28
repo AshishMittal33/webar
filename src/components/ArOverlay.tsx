@@ -26,6 +26,8 @@ interface ArOverlayProps {
   onResetWall: () => void;
   onClear: () => void;
   onExit: () => void;
+  /** Called when the details panel opens or closes (fps stats cost redraws). */
+  onStatsToggle: (open: boolean) => void;
   /** True when rendered without a session, only to look at the UI. */
   previewMode?: boolean;
 }
@@ -55,7 +57,7 @@ function guidance(
 ): string {
   if (tracking === 'initializing') return 'Move your phone slowly over the floor to scan the area.';
   if (tracking === 'lost')
-    return 'Tracking lost. Step back, point at the floor or furniture, and move slowly until it recovers.';
+    return 'Tracking lost: the camera sees only plain wall. Tilt down so the floor is in view, step back, add light.';
   if (tracking === 'limited')
     return 'Tracking is limited, usually from being too close to a plain wall. Step back and keep some floor in view.';
   if (!hitTest) return 'This device did not grant hit-testing, so surfaces cannot be detected.';
@@ -120,10 +122,15 @@ export default function ArOverlay({
   onResetWall,
   onClear,
   onExit,
+  onStatsToggle,
   previewMode,
 }: ArOverlayProps) {
   const [showInfo, setShowInfo] = useState(false);
   const uiRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    onStatsToggle(showInfo);
+  }, [showInfo, onStatsToggle]);
 
   useEffect(() => {
     const el = uiRef.current;

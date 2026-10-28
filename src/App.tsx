@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { ArEngine } from './ar/ArEngine';
 import {
@@ -172,6 +172,8 @@ export default function App() {
     engine.resetWall();
   };
 
+  const handleStatsToggle = useCallback((open: boolean) => engine.setStatsEnabled(open), [engine]);
+
   const handleClear = () => {
     if (UI_PREVIEW) {
       setObjectCount(0);
@@ -212,6 +214,7 @@ export default function App() {
             onResetWall={handleResetWall}
             onClear={handleClear}
             onExit={handleExit}
+            onStatsToggle={handleStatsToggle}
             previewMode={UI_PREVIEW}
           />,
           overlayRoot,
