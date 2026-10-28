@@ -1,9 +1,11 @@
 import * as THREE from 'three';
+import { holdMatrix, relativeRotation, SensorCalibrator, type CalibrationResult } from './hold';
 import { getModelSpec } from './models';
 import {
   describeArError,
   type EngineEvent,
   type EngineListener,
+  type MotionHoldState,
   type ObjectKind,
   type ObjectSummary,
   type SessionInfo,
@@ -105,6 +107,23 @@ type AnchorCapableFrame = XRFrame & {
   createAnchor?: (pose: XRRigidTransform, space: XRSpace) => Promise<XRAnchor>;
 };
 
+/** The Generic Sensor API's RelativeOrientationSensor, which @types may lack. */
+interface OrientationSensorLike extends EventTarget {
+  quaternion?: number[] | null;
+  start(): void;
+  stop(): void;
+}
+type OrientationSensorCtor = new (options: {
+  frequency: number;
+  referenceFrame: 'device' | 'screen';
+}) => OrientationSensorLike;
+
+function holdStateOf(result: CalibrationResult): MotionHoldState {
+  if (result === 'calibrating') return 'calibrating';
+  if (result === 'unusable') return 'unusable';
+  return 'ready';
+}
+
 interface Transform {
   position: THREE.Vector3;
   quaternion: THREE.Quaternion;
@@ -175,6 +194,20 @@ export class ArEngine {
   private floorY: number | null = null;
   private anchorsAvailable = false;
 
+  // Motion-sensor hold while camera tracking is paused. Placed objects live
+  // under `world`, whose matrix is identity except during a hold.
+  private readonly world = new THREE.Group();
+  private sensor: OrientationSensorLike | null = null;
+  private sensorQuat: THREE.Quaternion | null = null;
+  private readonly calibrator = new SensorCalibrator();
+  private sensorState: MotionHoldState = 'off';
+  private holding = false;
+  private hasLastGood = false;
+  private lastHadSensor = false;
+  private readonly lastCamPos = new THREE.Vector3();
+  private readonly lastCamQuat = new THREE.Quaternion();
+  private readonly lastSensorQuat = new THREE.Quaternion();
+
   private objects: SceneObject[] = [];
   private selectedId: string | null = null;
   private nextId = 1;
@@ -190,6 +223,8 @@ export class ArEngine {
     const dir = new THREE.DirectionalLight(0xffffff, 0.8);
     dir.position.set(0.5, 1, 0.25);
     this.scene.add(hemi, dir);
+    this.world.matrixAutoUpdate = false;
+    this.scene.add(this.world);
   }
 
   subscribe(listener: EngineListener): () => void {
@@ -257,6 +292,107 @@ export class ArEngine {
     renderer.setAnimationLoop(this.onFrame);
     this.emit({ type: 'started', info });
     this.emitObjects();
+    this.startSensor();
+  }
+
+  // ----- Motion sensor -----
+
+  private startSensor() {
+    const Ctor = (window as unknown as { RelativeOrientationSensor?: OrientationSensorCtor })
+      .RelativeOrientationSensor;
+    if (!Ctor) {
+      this.setSensorState('off');
+      return;
+    }
+    try {
+      const sensor = new Ctor({ frequency: 60, referenceFrame: 'screen' });
+      sensor.addEventListener('reading', () => {
+        const q = sensor.quaternion;
+        if (!q) return;
+        if (!this.sensorQuat) this.sensorQuat = new THREE.Quaternion();
+        this.sensorQuat.set(q[0], q[1], q[2], q[3]);
+      });
+      sensor.addEventListener('error', () => {
+        this.stopSensor();
+        this.setSensorState('off');
+      });
+      sensor.start();
+      this.sensor = sensor;
+      this.calibrator.reset();
+      this.setSensorState('calibrating');
+    } catch {
+      this.setSensorState('off');
+    }
+  }
+
+  private stopSensor() {
+    try {
+      this.sensor?.stop();
+    } catch {
+      // Already stopped.
+    }
+    this.sensor = null;
+    this.sensorQuat = null;
+  }
+
+  private setSensorState(state: MotionHoldState) {
+    if (state === this.sensorState) return;
+    this.sensorState = state;
+    this.emit({ type: 'sensor', state });
+  }
+
+  private setHolding(active: boolean) {
+    if (active === this.holding) return;
+    this.holding = active;
+    if (!active) {
+      this.world.matrix.identity();
+      this.world.matrixWorldNeedsUpdate = true;
+    }
+    this.emit({ type: 'hold', active });
+  }
+
+  /**
+   * With a camera pose: remember it with the matching sensor reading, feed
+   * the calibrator, and end any hold. Without one: if the sensor has been
+   * verified against the camera, rotate the world so objects stay where
+   * they were as the user turns the device.
+   */
+  private updateHold(viewerPose: XRViewerPose | null) {
+    if (viewerPose) {
+      const t = (viewerPose.views[0] ?? viewerPose).transform;
+      this.lastCamPos.set(t.position.x, t.position.y, t.position.z);
+      this.lastCamQuat.set(t.orientation.x, t.orientation.y, t.orientation.z, t.orientation.w);
+      this.hasLastGood = true;
+      this.lastHadSensor = this.sensorQuat !== null;
+      if (this.sensorQuat) {
+        this.lastSensorQuat.copy(this.sensorQuat);
+        if (!viewerPose.emulatedPosition && this.sensorState !== 'off') {
+          this.setSensorState(holdStateOf(this.calibrator.add(this.lastCamQuat, this.sensorQuat)));
+        }
+      }
+      this.setHolding(false);
+      return;
+    }
+
+    const convention = this.calibrator.result;
+    if (
+      this.sensorState !== 'ready' ||
+      !this.hasLastGood ||
+      !this.lastHadSensor ||
+      !this.sensorQuat ||
+      (convention !== 'device-to-ref' && convention !== 'ref-to-device')
+    ) {
+      return;
+    }
+    const r = relativeRotation(convention, this.lastSensorQuat, this.sensorQuat);
+    holdMatrix(this.lastCamPos, this.lastCamQuat, r, this.world.matrix);
+    this.world.matrixWorldNeedsUpdate = true;
+    this.setHolding(true);
+  }
+
+  /** Editing needs the live camera, so it pauses while tracking does. */
+  private get canEdit(): boolean {
+    return !this.holding && this.noPoseFrames === 0;
   }
 
   /** Ends the session. Resolves after cleanup; safe to call twice. */
@@ -328,11 +464,13 @@ export class ArEngine {
       const refSpace = renderer.xr.getReferenceSpace();
       const viewerPose = (refSpace ? frame.getViewerPose(refSpace) : null) ?? null;
       this.updateTracking(viewerPose);
-      // No pose means ARCore has lost tracking. Drawing objects with a stale
-      // camera makes them look glued to the screen, so hide them, but only
-      // after a short grace period so brief dropouts do not flicker.
+      // No pose means ARCore has paused camera tracking. If the motion
+      // sensor is verified, objects are held in place by it. Otherwise they
+      // are hidden after a short grace period, because drawing them with a
+      // stale camera makes them look glued to the screen.
       this.noPoseFrames = viewerPose ? 0 : this.noPoseFrames + 1;
-      this.scene.visible = this.noPoseFrames < HIDE_AFTER_NO_POSE_FRAMES;
+      this.updateHold(viewerPose);
+      this.scene.visible = this.holding || this.noPoseFrames < HIDE_AFTER_NO_POSE_FRAMES;
       if (refSpace) {
         this.learnFloor(frame, refSpace);
         this.updateAnchors(frame, refSpace);
@@ -354,7 +492,9 @@ export class ArEngine {
    * tracking is degraded or the object is being dragged.
    */
   private updateAnchors(frame: XRFrame, refSpace: XRReferenceSpace) {
-    if (!this.anchorsAvailable) return;
+    // Anchor poses are in world space; skip them while there is no camera
+    // pose (and the world may be rotated for a motion-sensor hold).
+    if (!this.anchorsAvailable || this.noPoseFrames > 0) return;
     const f = frame as AnchorCapableFrame;
 
     for (const obj of this.objects) {
@@ -501,6 +641,7 @@ export class ArEngine {
 
   /** Creates an object about 1.5 m in front of the user, facing them. */
   spawn(kind: ObjectKind): string | null {
+    if (!this.canEdit) return null;
     const cam = this.cameraFrame();
     if (!cam) return null;
     const spec = getModelSpec(kind);
@@ -545,7 +686,7 @@ export class ArEngine {
     root.position.copy(t.position);
     root.quaternion.copy(t.quaternion);
     root.scale.setScalar(t.scale);
-    this.scene.add(root);
+    this.world.add(root);
 
     const obj: SceneObject = {
       id: String(this.nextId++),
@@ -610,7 +751,7 @@ export class ArEngine {
   nudge(dx: number, dy: number, dz: number): void {
     const obj = this.selected;
     const cam = this.cameraFrame();
-    if (!obj || !cam) return;
+    if (!obj || !cam || !this.canEdit) return;
     this.pushUndo({ type: 'transform', id: obj.id, before: this.snapshot(obj) });
     obj.root.position.addScaledVector(cam.right, dx).addScaledVector(UP, dy).addScaledVector(cam.forward, dz);
     this.clampPosition(obj);
@@ -630,7 +771,7 @@ export class ArEngine {
   faceUser(): void {
     const obj = this.selected;
     const cam = this.cameraFrame();
-    if (!obj || !cam) return;
+    if (!obj || !cam || !this.canEdit) return;
     this.pushUndo({ type: 'transform', id: obj.id, before: this.snapshot(obj) });
     const toCam = cam.position.clone().sub(obj.root.position);
     obj.root.quaternion.copy(quatFacing(toCam));
@@ -650,7 +791,7 @@ export class ArEngine {
   duplicate(): void {
     const obj = this.selected;
     const cam = this.cameraFrame();
-    if (!obj || !cam) return;
+    if (!obj || !cam || !this.canEdit) return;
     const box = new THREE.Box3().setFromObject(obj.root);
     const width = box.getSize(new THREE.Vector3()).x || 0.5;
     const t = this.snapshot(obj);
@@ -680,7 +821,7 @@ export class ArEngine {
   }
 
   private removeObject(obj: SceneObject) {
-    this.scene.remove(obj.root);
+    this.world.remove(obj.root);
     obj.outline.geometry.dispose();
     obj.anchor?.delete();
     obj.anchor = null;
@@ -742,6 +883,9 @@ export class ArEngine {
    */
   handleGesture(e: GestureEvent): void {
     if (!this.renderer) return;
+    // Gestures map the screen through the live camera; pause them while
+    // camera tracking is paused. Lifting fingers is still processed.
+    if (!this.canEdit && (e.type === 'down' || e.type === 'move')) return;
 
     if (e.type === 'down') {
       this.pointers.set(e.id, { x: e.x, y: e.y });
@@ -957,6 +1101,16 @@ export class ArEngine {
     this.hitTestSource = null;
     this.floorY = null;
     this.scene.visible = true;
+
+    this.stopSensor();
+    this.calibrator.reset();
+    this.sensorState = 'off';
+    this.holding = false;
+    this.hasLastGood = false;
+    this.lastHadSensor = false;
+    this.noPoseFrames = 0;
+    this.world.matrix.identity();
+    this.world.matrixWorldNeedsUpdate = true;
 
     if (this.renderer) {
       this.renderer.setAnimationLoop(null);

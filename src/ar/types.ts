@@ -1,5 +1,13 @@
 export type TrackingState = 'initializing' | 'tracking' | 'limited' | 'lost';
 
+/**
+ * Motion-sensor hold readiness.
+ * off: no orientation sensor; calibrating: comparing it with the camera;
+ * ready: verified and used while camera tracking is paused;
+ * unusable: it did not match the camera, so it is never used.
+ */
+export type MotionHoldState = 'off' | 'calibrating' | 'ready' | 'unusable';
+
 /** Catalogue entries. More kinds are added in models.ts without touching the engine. */
 export type ObjectKind = 'tv' | 'cube';
 
@@ -38,6 +46,8 @@ export type EngineEvent =
   | { type: 'visibility'; state: XRVisibilityState }
   | { type: 'fps'; fps: number }
   | { type: 'floor'; known: boolean }
+  | { type: 'hold'; active: boolean }
+  | { type: 'sensor'; state: MotionHoldState }
   | { type: 'objects'; objects: ObjectSummary[]; selectedId: string | null }
   | { type: 'ended'; reason: 'user' | 'browser' }
   | { type: 'error'; error: ArError };
