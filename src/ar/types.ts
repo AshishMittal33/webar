@@ -1,46 +1,12 @@
 export type TrackingState = 'initializing' | 'tracking' | 'limited' | 'lost';
 
-/**
- * Rough classification of the surface under the reticle, derived from the
- * hit-test pose normal. ARCore does not tell us "floor" or "wall" directly.
- */
-export type SurfaceType = 'horizontal' | 'vertical' | 'other';
+/** Catalogue entries. More kinds are added in models.ts without touching the engine. */
+export type ObjectKind = 'tv' | 'cube';
 
-/** What the user is trying to place right now. */
-export type PlacementMode = 'floor' | 'wall';
-
-/**
- * Where the reticle pose came from.
- * - hit: a real WebXR hit-test result on a detected plane
- * - depth: estimated from the depth-sensing API at the screen centre
- */
-export type ReticleSource = 'hit' | 'depth';
-
-export interface ReticleState {
-  visible: boolean;
-  surface: SurfaceType | null;
-  source: ReticleSource | null;
-  /** Distance from the camera to the reticle in metres, when visible. */
-  distance: number | null;
-}
-
-/**
- * How a wall object ended up where it is. Shown to the user, never hidden.
- * - wall-hit:  real vertical plane from hit-testing
- * - depth:     depth-sensing estimate (optional, off by default)
- * - wall-line: the wall the user defined with two floor taps
- */
-export type WallMethod = 'wall-hit' | 'depth' | 'wall-line';
-
-/**
- * Manual wall definition progress. Two taps along the line where the wall
- * meets the floor define the wall; afterwards TVs snap onto it.
- */
-export type WallSetupState = 'none' | 'first-point' | 'defined';
-
-export interface EngineStartOptions {
-  /** Request ARCore depth sensing. Heavier on the device; off by default. */
-  useDepth: boolean;
+/** What React needs to know about a placed object. Transforms stay in the engine. */
+export interface ObjectSummary {
+  id: string;
+  kind: ObjectKind;
 }
 
 /** Facts about the running session, reported once it has started. */
@@ -52,10 +18,8 @@ export interface SessionInfo {
   environmentBlendMode: string;
   referenceSpace: string;
   domOverlaySupported: boolean;
+  /** Hit-testing is used only to learn the floor height for spawning. */
   hitTestSupported: boolean;
-  anchorsSupported: boolean;
-  /** Depth-sensing granted and readable on the CPU. */
-  depthSensingSupported: boolean;
   /** WebXR framebuffer scale actually used (1 = native, 0.5 = quarter pixels). */
   renderScale: number;
 }
@@ -71,10 +35,8 @@ export type EngineEvent =
   | { type: 'tracking'; state: TrackingState }
   | { type: 'visibility'; state: XRVisibilityState }
   | { type: 'fps'; fps: number }
-  | { type: 'reticle'; reticle: ReticleState }
-  | { type: 'objects'; count: number; anchored: number; lastWallMethod: WallMethod | null }
-  | { type: 'depth'; available: boolean }
-  | { type: 'wall'; state: WallSetupState }
+  | { type: 'floor'; known: boolean }
+  | { type: 'objects'; objects: ObjectSummary[]; selectedId: string | null }
   | { type: 'ended'; reason: 'user' | 'browser' }
   | { type: 'error'; error: ArError };
 

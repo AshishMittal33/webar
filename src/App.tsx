@@ -1,15 +1,13 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { ArEngine } from './ar/ArEngine';
+import { ArEngine, type GestureEvent } from './ar/ArEngine';
 import {
   describeArError,
   type ArError,
-  type PlacementMode,
-  type ReticleState,
+  type ObjectKind,
+  type ObjectSummary,
   type SessionInfo,
   type TrackingState,
-  type WallMethod,
-  type WallSetupState,
 } from './ar/types';
 import ArOverlay from './components/ArOverlay';
 import Landing from './components/Landing';
@@ -17,18 +15,6 @@ import Landing from './components/Landing';
 type Screen = 'landing' | 'ar';
 
 const UI_PREVIEW = new URLSearchParams(window.location.search).get('ui') === 'preview';
-
-const NO_RETICLE: ReticleState = { visible: false, surface: null, source: null, distance: null };
-
-const DEPTH_PREF_KEY = 'webar.useDepth';
-
-function readDepthPref(): boolean {
-  try {
-    return localStorage.getItem(DEPTH_PREF_KEY) === '1';
-  } catch {
-    return false;
-  }
-}
 
 export default function App() {
   const engineRef = useRef<ArEngine | null>(null);
@@ -41,33 +27,23 @@ export default function App() {
 
   const [screen, setScreen] = useState<Screen>(UI_PREVIEW ? 'ar' : 'landing');
   const [notice, setNotice] = useState<ArError | null>(null);
-  const [useDepth, setUseDepth] = useState<boolean>(readDepthPref);
   const [tracking, setTracking] = useState<TrackingState>(UI_PREVIEW ? 'tracking' : 'initializing');
   const [info, setInfo] = useState<SessionInfo | null>(null);
   const [visibility, setVisibility] = useState<XRVisibilityState>('visible');
   const [fps, setFps] = useState(0);
-  const [mode, setMode] = useState<PlacementMode>('floor');
-  const [reticle, setReticle] = useState<ReticleState>(
-    UI_PREVIEW ? { visible: true, surface: 'horizontal', source: 'hit', distance: 1.5 } : NO_RETICLE,
-  );
-  const [depthAvailable, setDepthAvailable] = useState(false);
-  const [wallSetup, setWallSetup] = useState<WallSetupState>('none');
-  const [objectCount, setObjectCount] = useState(0);
-  const [anchoredCount, setAnchoredCount] = useState(0);
-  const [lastWallMethod, setLastWallMethod] = useState<WallMethod | null>(null);
+  const [floorKnown, setFloorKnown] = useState(false);
+  const [objects, setObjects] = useState<ObjectSummary[]>([]);
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [canUndo, setCanUndo] = useState(false);
 
   useEffect(() => {
     return engine.subscribe((e) => {
       switch (e.type) {
         case 'started':
           setInfo(e.info);
-          setDepthAvailable(e.info.depthSensingSupported);
           setTracking('initializing');
           setVisibility('visible');
-          setReticle(NO_RETICLE);
-          setObjectCount(0);
-          setAnchoredCount(0);
-          setLastWallMethod(null);
+          setFloorKnown(false);
           break;
         case 'tracking':
           setTracking(e.state);
@@ -78,25 +54,20 @@ export default function App() {
         case 'fps':
           setFps(e.fps);
           break;
-        case 'reticle':
-          setReticle(e.reticle);
-          break;
-        case 'depth':
-          setDepthAvailable(e.available);
-          break;
-        case 'wall':
-          setWallSetup(e.state);
+        case 'floor':
+          setFloorKnown(e.known);
           break;
         case 'objects':
-          setObjectCount(e.count);
-          setAnchoredCount(e.anchored);
-          setLastWallMethod(e.lastWallMethod);
+          setObjects(e.objects);
+          setSelectedId(e.selectedId);
+          setCanUndo(engine.canUndo);
           break;
         case 'ended':
           setScreen('landing');
           setInfo(null);
-          setReticle(NO_RETICLE);
-          setWallSetup('none');
+          setObjects([]);
+          setSelectedId(null);
+          setCanUndo(false);
           if (e.reason === 'browser') {
             setNotice({
               code: 'SessionEnded',
@@ -113,23 +84,12 @@ export default function App() {
     });
   }, [engine]);
 
-  const handleDepthChange = (value: boolean) => {
-    setUseDepth(value);
-    try {
-      localStorage.setItem(DEPTH_PREF_KEY, value ? '1' : '0');
-    } catch {
-      // Private mode or storage blocked: the choice just lasts this visit.
-    }
-  };
-
   // Called synchronously from the Start button tap so user activation is kept.
   const handleStart = () => {
     if (!canvasHost.current || !overlayRoot) return;
     setNotice(null);
     setScreen('ar');
-    engine.setMode(mode);
-    engine.start(canvasHost.current, overlayRoot, { useDepth }).catch((err) => {
-      // 'error' event already carried the friendly message; this is a safety net.
+    engine.start(canvasHost.current, overlayRoot).catch((err) => {
       setNotice(describeArError(err));
       setScreen('landing');
     });
@@ -143,51 +103,69 @@ export default function App() {
     void engine.end();
   };
 
-  const handleModeChange = (next: PlacementMode) => {
-    setMode(next);
-    engine.setMode(next);
-    if (UI_PREVIEW) {
-      setReticle({ visible: true, surface: 'horizontal', source: 'hit', distance: 1.5 });
-    }
-  };
-
-  const handlePlace = () => {
-    if (UI_PREVIEW) {
-      if (mode === 'wall' && wallSetup === 'none') setWallSetup('first-point');
-      else if (mode === 'wall' && wallSetup === 'first-point') setWallSetup('defined');
-      else {
-        setObjectCount((c) => c + 1);
-        if (mode === 'wall') setLastWallMethod('wall-line');
-      }
-      return;
-    }
-    engine.requestPlace();
-  };
-
-  const handleResetWall = () => {
-    if (UI_PREVIEW) {
-      setWallSetup('none');
-      return;
-    }
-    engine.resetWall();
-  };
-
   const handleStatsToggle = useCallback((open: boolean) => engine.setStatsEnabled(open), [engine]);
 
-  const handleClear = () => {
+  // In UI preview mode there is no engine session; fake a small object list
+  // so the control pad can be looked at on a desktop.
+  const previewSpawn = (kind: ObjectKind) => {
+    const id = String(objects.length + 1);
+    setObjects((o) => [...o, { id, kind }]);
+    setSelectedId(id);
+    setCanUndo(true);
+  };
+
+  const handleSpawn = (kind: ObjectKind) => (UI_PREVIEW ? previewSpawn(kind) : void engine.spawn(kind));
+  const handleDeselect = () => (UI_PREVIEW ? setSelectedId(null) : engine.select(null));
+  const handleDelete = () => {
     if (UI_PREVIEW) {
-      setObjectCount(0);
-      setLastWallMethod(null);
+      setObjects((o) => o.filter((x) => x.id !== selectedId));
+      setSelectedId(null);
       return;
     }
-    engine.clearObjects();
+    engine.deleteSelected();
   };
+  const handleClear = () => {
+    if (UI_PREVIEW) {
+      setObjects([]);
+      setSelectedId(null);
+      setCanUndo(false);
+      return;
+    }
+    engine.clearAll();
+  };
+
+  const afterEdit = () => setCanUndo(engine.canUndo);
+  const handleNudge = (dx: number, dy: number, dz: number) => {
+    engine.nudge(dx, dy, dz);
+    afterEdit();
+  };
+  const handleRotate = (deg: number) => {
+    engine.rotate(deg);
+    afterEdit();
+  };
+  const handleFaceUser = () => {
+    engine.faceUser();
+    afterEdit();
+  };
+  const handleScale = (f: number) => {
+    engine.scaleBy(f);
+    afterEdit();
+  };
+  const handleUndo = () => {
+    if (UI_PREVIEW) return;
+    engine.undo();
+  };
+  const handleGesture = useCallback(
+    (e: GestureEvent) => {
+      engine.handleGesture(e);
+      if (e.type === 'up' || e.type === 'cancel') setCanUndo(engine.canUndo);
+    },
+    [engine],
+  );
 
   return (
     <>
-      {screen === 'landing' && (
-        <Landing onStart={handleStart} notice={notice} useDepth={useDepth} onDepthChange={handleDepthChange} />
-      )}
+      {screen === 'landing' && <Landing onStart={handleStart} notice={notice} />}
 
       {/* Always mounted so the engine can attach a canvas and the overlay root
           exists before requestSession is called. */}
@@ -202,17 +180,21 @@ export default function App() {
             info={info}
             visibility={visibility}
             fps={fps}
-            mode={mode}
-            reticle={reticle}
-            depthAvailable={depthAvailable}
-            wallSetup={wallSetup}
-            objectCount={objectCount}
-            anchoredCount={anchoredCount}
-            lastWallMethod={lastWallMethod}
-            onModeChange={handleModeChange}
-            onPlace={handlePlace}
-            onResetWall={handleResetWall}
+            floorKnown={floorKnown}
+            objects={objects}
+            selectedId={selectedId}
+            canUndo={canUndo}
+            onSpawn={handleSpawn}
+            onNudge={handleNudge}
+            onRotate={handleRotate}
+            onFaceUser={handleFaceUser}
+            onScale={handleScale}
+            onDuplicate={() => engine.duplicate()}
+            onDelete={handleDelete}
+            onDeselect={handleDeselect}
+            onUndo={handleUndo}
             onClear={handleClear}
+            onGesture={handleGesture}
             onExit={handleExit}
             onStatsToggle={handleStatsToggle}
             previewMode={UI_PREVIEW}

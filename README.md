@@ -10,9 +10,9 @@ app, no paid SDKs, no backend.
 | ----- | ---- | ----- |
 | 1 | React + TypeScript + Vite + Three.js project, landing screen, WebXR support check | Done |
 | 2 | Real immersive-ar session starts on an Android device | Done, verified on device |
-| 3 | Hit-testing, reticle, cubes placed on the floor with anchors | Done, verified on device |
-| 4 | Wall placement: hit-test, depth estimate, floor-edge fallback; placeholder TV | Built, awaiting phone test |
-| 5 | Multi-object manager and touch manipulation | Next |
+| 3 | Hit-testing and floor placement (verified on device) | Superseded by spawn-and-adjust |
+| 4 | Wall placement investigation: hit-test, depth, two-point wall line | Investigated; superseded, see limitations |
+| 5 | Multi-object manager, spawn in front of user, drag/pinch/twist + button controls, undo | Built, awaiting phone test |
 | 6 | Catalogue, error handling, performance, JSON export/import | Pending |
 | 7 | Free HTTPS deployment and QR code | Pending |
 
@@ -59,11 +59,11 @@ src/
   ar/
     support.ts        WebXR capability detection (no session started)
     types.ts          Tracking state, session info, error mapping
-    ArEngine.ts       WebXR session, renderer, hit-test/depth reticle, anchors, placement
-    models.ts         Placeholder cube and TV built from primitives (GLB later)
+    ArEngine.ts       WebXR session, renderer, object manager, gestures, undo
+    models.ts         Catalogue of placeholder models (TV, box); GLB later
   components/
     Landing.tsx       Start screen, device check, instructions
-    ArOverlay.tsx     In-session UI (dom-overlay): status, details, Exit
+    ArOverlay.tsx     In-session UI: status, catalogue, control pad, gesture layer
   styles/global.css   Mobile-first styles
 public/models/        GLB assets (added in later phases)
 docs/
@@ -76,27 +76,34 @@ docs/
 Open the site with `?ui=preview` to see the in-session overlay UI on a
 desktop. It is clearly labelled and starts no AR session.
 
+## How placement works now (and why)
+
+Objects are spawned about 1.5 m in front of the user and then positioned by
+hand: drag to slide, pinch to resize, twist two fingers to rotate, move two
+fingers up or down to push the object away or pull it closer, or use the
+precise buttons (5 cm steps, 10 degree turns). Objects are fixed in the AR
+session's local coordinate space and never move on their own.
+
+Hit-testing is used only to learn the floor height so boxes and furniture
+spawn on the floor. TVs spawn at eye height facing the user.
+
 ## Honest limitations
 
 - Only Android Chrome is targeted. iOS Safari does not implement WebXR AR.
-- Vertical (wall) hit-testing is not guaranteed. WebXR only reports a wall
-  when ARCore has detected a vertical plane, which needs a textured wall and
-  time; plain painted walls are often never detected. On the first test
-  device the floor was detected within seconds and the wall never was.
-  Tracking the camera close to a plain wall is also unreliable on every
-  device, because ARCore has no visual features to lock onto. Wall mode
-  therefore uses, in order:
-  1. A real vertical hit-test result when one exists (green ring).
-  2. The WebXR depth-sensing API, only when the user turns on "Depth wall
-     assist" on the start screen. Several depth samples are fitted to find
-     the wall direction (blue ring, labelled "estimated"). Depth costs real
-     CPU and made tracking worse on the first test tablet, so it is off by
-     default.
-  3. The main method, which needs only the floor: two taps along the line
-     where the wall meets the floor define the wall. A faint translucent wall
-     is drawn, and every TV then snaps flat onto it 1.2 m above the floor.
-     Users stand back from the wall, where tracking is stable.
-  The method used is always shown in the guide text and the "i" panel.
+- Automatic wall placement was investigated in Phase 4 and dropped:
+  - WebXR vertical hit-testing only works once ARCore has detected a
+    vertical plane. On the test tablet the floor was found in seconds but a
+    plain painted wall was never detected (a textured door was).
+  - The depth-sensing API can estimate a wall, but requesting it made
+    tracking noticeably worse on the test tablet.
+  - ARCore loses tracking when the camera sees only blank wall, on any
+    device, because there are no visual features. No app can fix this.
+    Users should stand back and keep floor or furniture in view.
+  - ARCore anchors continuously nudge object poses; near a blank wall those
+    corrections are noisy and made TVs shiver. Objects are therefore kept
+    static in local space instead of anchored.
+  The engine can still read hit-test and depth results, so a future version
+  can offer "snap to detected wall" where a device supports it.
 - Exported JSON stores virtual coordinates relative to the AR session origin.
   Re-importing in a new session does not restore objects to the same
   real-world spot without persistent anchors.

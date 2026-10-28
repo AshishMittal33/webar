@@ -1,70 +1,48 @@
 import * as THREE from 'three';
-import { createCube, createTv } from './models';
+import { getModelSpec } from './models';
 import {
   describeArError,
   type EngineEvent,
   type EngineListener,
-  type EngineStartOptions,
-  type PlacementMode,
-  type ReticleSource,
-  type ReticleState,
+  type ObjectKind,
+  type ObjectSummary,
   type SessionInfo,
-  type SurfaceType,
   type TrackingState,
-  type WallMethod,
-  type WallSetupState,
 } from './types';
 
 /**
- * Features we always ask for. Only "local" tracking is required so the
- * session can start on every ARCore device; the rest are optional and are
- * reported back through SessionInfo so the UI can say what is really active.
- * Depth sensing is added only when the user opts in: it costs real CPU on
- * the device and made tracking worse on the first test tablet.
+ * Only "local" tracking is required so the session can start on every
+ * ARCore device. Hit-testing is optional and used for one thing: learning
+ * the floor height so floor objects spawn at the right level. No planes,
+ * walls or anchors are involved in placement; objects are fixed in the
+ * session's local space and only move when the user moves them.
  */
-const BASE_OPTIONAL_FEATURES = ['dom-overlay', 'hit-test', 'anchors'];
-const DEPTH_FEATURE = 'depth-sensing';
+const OPTIONAL_FEATURES = ['dom-overlay', 'hit-test'];
 
 /** Pixel budget per AR frame, roughly 1080p. Above this we scale down. */
 const TARGET_PIXELS = 2_000_000;
-
-/** Height of the TV mounting point above the floor for wall-line placement. */
-const WALL_TV_HEIGHT = 1.2;
-
-/** Two wall points closer than this are too close to define a direction. */
-const WALL_MIN_SPAN = 0.3;
-
-/** Closer than this to the target, ARCore tends to lose its features. */
-const TOO_CLOSE_M = 0.7;
-
-/** Depth estimates outside this range are treated as "no wall here". */
-const DEPTH_MIN = 0.3;
-const DEPTH_MAX = 8;
 
 /** Frames a degraded pose must persist before the status changes (~60 fps). */
 const LIMITED_AFTER_FRAMES = 20;
 const LOST_AFTER_FRAMES = 45;
 
-/** Depth samples across the screen centre line, as normalized x positions. */
-const DEPTH_SAMPLE_XS = [0.3, 0.4, 0.5, 0.6, 0.7];
-const WALL_FIT_TOLERANCE = 0.06;
-const WALL_FIT_MIN_SPAN = 0.2;
+/** Where new objects appear relative to the user. */
+const SPAWN_DISTANCE = 1.5;
+const TV_SPAWN_BELOW_EYE = 0.3;
+const FLOOR_BELOW_EYE_FALLBACK = 1.4;
 
-/** Anchor corrections below these are ignored as tracking noise. */
-const ANCHOR_DEADBAND_M = 0.005;
-const ANCHOR_DEADBAND_RAD = THREE.MathUtils.degToRad(0.5);
-/** Per-frame blend toward the anchor pose for corrections above the deadband. */
-const ANCHOR_SMOOTHING = 0.1;
-/** A correction this large is a relocalisation; apply it at once. */
-const ANCHOR_SNAP_M = 0.25;
+const MIN_SCALE = 0.2;
+const MAX_SCALE = 5;
+const MAX_DISTANCE = 12;
 
-/** Reticle smoothing factor per frame (0 = frozen, 1 = raw). */
-const RETICLE_SMOOTHING = 0.25;
-/** A jump larger than this resets smoothing (user aimed somewhere else). */
-const RETICLE_RESET_DISTANCE = 0.3;
+/** One-finger movement below this (normalized screen units) is a tap. */
+const TAP_SLOP = 0.01;
+/** Two-finger vertical drag: metres of push/pull per full screen height. */
+const PUSH_PER_SCREEN = 2.5;
+
+const UNDO_LIMIT = 30;
 
 const UP = new THREE.Vector3(0, 1, 0);
-const ONE = new THREE.Vector3(1, 1, 1);
 
 /**
  * Chooses the WebXR framebuffer scale for this screen: 1.0 on phones with
@@ -78,80 +56,74 @@ export function computeRenderScale(): number {
   return Math.min(1, Math.max(0.5, Math.round(scale * 100) / 100));
 }
 
-/** Classify a surface by the direction of its normal. */
-function classifyNormal(normal: THREE.Vector3): SurfaceType {
-  if (normal.y > 0.75) return 'horizontal';
-  if (Math.abs(normal.y) < 0.35) return 'vertical';
-  return 'other';
-}
-
-/** Rotation whose +Y axis is `normal`; used for the flat reticle ring. */
-function quatWithUpAxis(normal: THREE.Vector3): THREE.Quaternion {
-  const helper = Math.abs(normal.y) > 0.9 ? new THREE.Vector3(0, 0, -1) : UP;
-  const right = new THREE.Vector3().crossVectors(helper, normal).normalize();
-  const forward = new THREE.Vector3().crossVectors(right, normal).normalize();
-  const m = new THREE.Matrix4().makeBasis(right, normal, forward);
-  return new THREE.Quaternion().setFromRotationMatrix(m);
-}
-
-/** Rotation for an upright object whose front (+Z) points along `normal`. */
-function quatFacing(normal: THREE.Vector3): THREE.Quaternion {
-  const n = new THREE.Vector3(normal.x, 0, normal.z).normalize();
+/** Rotation for an upright object whose front (+Z) points along `dir`. */
+function quatFacing(dir: THREE.Vector3): THREE.Quaternion {
+  const n = new THREE.Vector3(dir.x, 0, dir.z).normalize();
+  if (n.lengthSq() < 1e-6) n.set(0, 0, 1);
   const right = new THREE.Vector3().crossVectors(UP, n).normalize();
   const m = new THREE.Matrix4().makeBasis(right, UP, n);
   return new THREE.Quaternion().setFromRotationMatrix(m);
 }
 
-interface PlacedObject {
-  /** Root whose matrix is the object pose; model children hang off it. */
+/** Pointer input from the overlay's gesture layer, normalized to [0, 1]. */
+export interface GestureEvent {
+  type: 'down' | 'move' | 'up' | 'cancel';
+  id: number;
+  x: number;
+  y: number;
+}
+
+interface SceneObject {
+  id: string;
+  kind: ObjectKind;
+  spawn: 'floor' | 'eye';
   root: THREE.Group;
-  anchor: XRAnchor | null;
-  kind: 'cube' | 'tv';
-  wallMethod: WallMethod | null;
+  outline: THREE.LineSegments;
 }
 
-/** The reticle's current real-world target, refreshed every frame. */
-interface Target {
+interface Transform {
   position: THREE.Vector3;
-  normal: THREE.Vector3;
-  surface: SurfaceType;
-  source: ReticleSource;
-  /** Present only for real hit-test results (lets us anchor to the plane). */
-  hit: XRHitTestResult | null;
-  /**
-   * The raw hit pose as a matrix. An anchor created from the hit result
-   * takes exactly this pose, so object offsets must be expressed against it.
-   */
-  hitMatrix: THREE.Matrix4 | null;
+  quaternion: THREE.Quaternion;
+  scale: number;
 }
 
-/** A wall defined by the user: a point on its base line, its direction, and its normal. */
-interface WallLine {
-  point: THREE.Vector3;
-  dir: THREE.Vector3;
-  normal: THREE.Vector3;
-}
+type UndoEntry =
+  | { type: 'transform'; id: string; before: Transform }
+  | { type: 'add'; id: string }
+  | { type: 'delete'; id: string; kind: ObjectKind; before: Transform };
 
-// Parts of the WebXR API that @types/webxr may not declare on this version.
-type AnchorCapableHit = XRHitTestResult & { createAnchor?: () => Promise<XRAnchor> };
-type AnchorCapableFrame = XRFrame & {
-  createAnchor?: (pose: XRRigidTransform, space: XRSpace) => Promise<XRAnchor>;
-};
-interface CpuDepthInformation {
-  getDepthInMeters(x: number, y: number): number;
-}
-type DepthCapableFrame = XRFrame & {
-  getDepthInformation?: (view: XRView) => CpuDepthInformation | null;
-};
-type DepthCapableSession = XRSession & { depthUsage?: string; enabledFeatures?: string[] };
+type Gesture =
+  | {
+      kind: 'drag';
+      pointerId: number;
+      objectId: string;
+      /** Plane the object slides on: horizontal for floor objects, facing the user for others. */
+      plane: THREE.Plane;
+      grabOffset: THREE.Vector3;
+      startX: number;
+      startY: number;
+      moved: boolean;
+      undoPushed: boolean;
+    }
+  | {
+      kind: 'two';
+      objectId: string;
+      startDistance: number;
+      startAngle: number;
+      startMidY: number;
+      startScale: number;
+      startQuaternion: THREE.Quaternion;
+      startPosition: THREE.Vector3;
+      forward: THREE.Vector3;
+    }
+  | { kind: 'tap-empty'; pointerId: number; startX: number; startY: number; moved: boolean };
+
+type FeatureSession = XRSession & { enabledFeatures?: string[] };
 
 /**
- * Owns the WebXR session, the Three.js renderer and the render loop.
- *
- * It is deliberately not a React component: the render loop runs at device
- * frame rate and must not cause React re-renders. React only hears about
- * discrete changes (session started, tracking state changed, reticle found
- * or lost, object placed, session ended) through the listener API.
+ * Owns the WebXR session, the Three.js renderer, the render loop and the
+ * placed objects. React never touches transforms: it sends commands
+ * (spawn, nudge, rotate, gestures) and listens for summary events.
  */
 export class ArEngine {
   readonly scene = new THREE.Scene();
@@ -163,7 +135,6 @@ export class ArEngine {
   private listeners = new Set<EngineListener>();
   private trackingState: TrackingState = 'initializing';
   private endedByUser = false;
-  private requestedFeatures: string[] = BASE_OPTIONAL_FEATURES;
 
   private frameCount = 0;
   private fpsWindowStart = 0;
@@ -171,65 +142,24 @@ export class ArEngine {
   private lostFrames = 0;
   private limitedFrames = 0;
 
-  // Surface finding
   private hitTestSource: XRHitTestSource | null = null;
-  private anchorsAvailable = false;
-  private depthAvailable = false;
-  private mode: PlacementMode = 'floor';
-
-  // Reticle
-  private readonly reticle: THREE.Group;
-  private readonly reticleRing: THREE.Mesh;
-  private reticleState: ReticleState = { visible: false, surface: null, source: null, distance: null };
-  private target: Target | null = null;
-  /** Lowest floor height seen from hit-testing this session, if any. */
   private floorY: number | null = null;
 
-  // Manual wall definition
-  private wallFirstPoint: THREE.Vector3 | null = null;
-  private wallLine: WallLine | null = null;
-  private wallSetup: WallSetupState = 'none';
-  private readonly wallMarkers = new THREE.Group();
-  private readonly markerGeometry = new THREE.SphereGeometry(0.02, 12, 8);
-  private readonly markerMaterial = new THREE.MeshBasicMaterial({ color: 0xf5b942 });
-  private readonly wallPlaneMaterial = new THREE.MeshBasicMaterial({
-    color: 0x4f8cff,
-    transparent: true,
-    opacity: 0.12,
-    side: THREE.DoubleSide,
-    depthWrite: false,
-  });
-  private readonly wallBaseMaterial = new THREE.MeshBasicMaterial({ color: 0x4f8cff });
+  private objects: SceneObject[] = [];
+  private selectedId: string | null = null;
+  private nextId = 1;
+  private undoStack: UndoEntry[] = [];
 
-  // Placement
-  private placeRequested = false;
-  private placed: PlacedObject[] = [];
-  private lastWallMethod: WallMethod | null = null;
+  private pointers = new Map<number, { x: number; y: number }>();
+  private gesture: Gesture | null = null;
+  private readonly raycaster = new THREE.Raycaster();
+  private readonly outlineMaterial = new THREE.LineBasicMaterial({ color: 0xf5b942 });
 
   constructor() {
     const hemi = new THREE.HemisphereLight(0xffffff, 0x667799, 1.0);
     const dir = new THREE.DirectionalLight(0xffffff, 0.8);
     dir.position.set(0.5, 1, 0.25);
     this.scene.add(hemi, dir);
-
-    // Reticle: flat ring lying on the surface plane. RingGeometry is in XY,
-    // so rotate it into XZ where +Y is the surface normal.
-    const ring = new THREE.Mesh(
-      new THREE.RingGeometry(0.06, 0.08, 32),
-      new THREE.MeshBasicMaterial({ color: 0x37c978, side: THREE.DoubleSide, transparent: true, opacity: 0.9 }),
-    );
-    ring.rotation.x = -Math.PI / 2;
-    const dot = new THREE.Mesh(
-      new THREE.CircleGeometry(0.01, 16),
-      new THREE.MeshBasicMaterial({ color: 0xffffff, side: THREE.DoubleSide }),
-    );
-    dot.rotation.x = -Math.PI / 2;
-    this.reticle = new THREE.Group();
-    this.reticle.add(ring, dot);
-    this.reticle.matrixAutoUpdate = false;
-    this.reticle.visible = false;
-    this.reticleRing = ring;
-    this.scene.add(this.reticle, this.wallMarkers);
   }
 
   subscribe(listener: EngineListener): () => void {
@@ -245,33 +175,23 @@ export class ArEngine {
     for (const l of this.listeners) l(event);
   }
 
+  // ----- Session -----
+
   /**
    * Must be called synchronously from a user gesture (button tap): Chrome
    * only allows requestSession with transient user activation, so nothing
    * here awaits before requestSession is invoked.
    */
-  async start(canvasHost: HTMLElement, overlayRoot: HTMLElement, options: EngineStartOptions): Promise<void> {
+  async start(canvasHost: HTMLElement, overlayRoot: HTMLElement): Promise<void> {
     if (this.session) throw new DOMException('Session already running', 'InvalidStateError');
     const xr = navigator.xr;
     if (!xr) throw new DOMException('WebXR not available', 'NotSupportedError');
 
-    this.requestedFeatures = options.useDepth
-      ? [...BASE_OPTIONAL_FEATURES, DEPTH_FEATURE]
-      : [...BASE_OPTIONAL_FEATURES];
-
-    const init: XRSessionInit & { depthSensing?: unknown } = {
+    const sessionPromise = xr.requestSession('immersive-ar', {
       requiredFeatures: ['local'],
-      optionalFeatures: this.requestedFeatures,
+      optionalFeatures: OPTIONAL_FEATURES,
       domOverlay: { root: overlayRoot },
-    };
-    if (options.useDepth) {
-      // CPU access is required to read depth values at chosen pixels.
-      init.depthSensing = {
-        usagePreference: ['cpu-optimized'],
-        dataFormatPreference: ['luminance-alpha', 'float32'],
-      };
-    }
-    const sessionPromise = xr.requestSession('immersive-ar', init);
+    });
 
     this.endedByUser = false;
     this.trackingState = 'initializing';
@@ -279,15 +199,12 @@ export class ArEngine {
     this.limitedFrames = 0;
     this.frameCount = 0;
     this.fpsWindowStart = 0;
-    this.placeRequested = false;
-    this.lastWallMethod = null;
 
     let session: XRSession;
     try {
       session = await sessionPromise;
     } catch (err) {
-      const error = describeArError(err);
-      this.emit({ type: 'error', error });
+      this.emit({ type: 'error', error: describeArError(err) });
       throw err;
     }
 
@@ -297,23 +214,18 @@ export class ArEngine {
 
     session.addEventListener('end', this.onSessionEnd);
     session.addEventListener('visibilitychange', this.onVisibilityChange);
-    session.addEventListener('select', this.onSelect);
 
     renderer.xr.setReferenceSpaceType('local');
-    // Render the AR layer at a lower internal resolution on large or very
-    // high-DPI screens. Big tablets otherwise push 5+ megapixels per frame.
     const renderScale = computeRenderScale();
     renderer.xr.setFramebufferScaleFactor(renderScale);
     await renderer.xr.setSession(session);
 
     const info = this.collectSessionInfo(session, renderScale);
-    this.anchorsAvailable = info.anchorsSupported;
-    this.depthAvailable = info.depthSensingSupported;
     await this.setupHitTest(session, info);
 
     renderer.setAnimationLoop(this.onFrame);
     this.emit({ type: 'started', info });
-    this.emit({ type: 'wall', state: this.wallSetup });
+    this.emitObjects();
   }
 
   /** Ends the session. Resolves after cleanup; safe to call twice. */
@@ -327,37 +239,15 @@ export class ArEngine {
     }
   }
 
-  setMode(mode: PlacementMode): void {
-    this.mode = mode;
-  }
-
-  /** Ask to place (or set a wall point) at the reticle on the next frame. */
-  requestPlace(): void {
-    this.placeRequested = true;
-  }
-
-  /** Forget the user-defined wall so a new one can be set. */
-  resetWall(): void {
-    this.wallFirstPoint = null;
-    this.wallLine = null;
-    this.clearWallMarkers();
-    this.setWallSetup('none');
-  }
-
-  /** Remove every placed object and its anchor. */
-  clearObjects(): void {
-    for (const obj of this.placed) {
-      this.scene.remove(obj.root);
-      obj.anchor?.delete();
-    }
-    this.placed = [];
-    this.lastWallMethod = null;
-    this.emitObjects();
+  /** Turn the once-a-second fps report on or off (it re-renders the overlay). */
+  setStatsEnabled(enabled: boolean): void {
+    this.statsEnabled = enabled;
+    this.frameCount = 0;
+    this.fpsWindowStart = 0;
   }
 
   private createRenderer(host: HTMLElement): THREE.WebGLRenderer {
     const renderer = new THREE.WebGLRenderer({
-      // MSAA is expensive on mobile GPUs; edges are acceptable without it.
       antialias: false,
       alpha: true,
       stencil: false,
@@ -367,46 +257,36 @@ export class ArEngine {
     renderer.setPixelRatio(1);
     renderer.setSize(host.clientWidth || window.innerWidth, host.clientHeight || window.innerHeight);
     renderer.xr.enabled = true;
-    // No shadow maps: mid-range phones and real-time shadows do not mix.
     renderer.shadowMap.enabled = false;
     host.appendChild(renderer.domElement);
     return renderer;
   }
 
   private collectSessionInfo(session: XRSession, renderScale: number): SessionInfo {
-    const s = session as DepthCapableSession;
-    const enabled = s.enabledFeatures ?? ['(enabledFeatures not reported by this browser)'];
-    const missing = this.requestedFeatures.filter((f) => !enabled.includes(f));
-    const depthCpu =
-      enabled.includes(DEPTH_FEATURE) && (s.depthUsage === undefined || s.depthUsage === 'cpu-optimized');
+    const enabled = (session as FeatureSession).enabledFeatures ?? ['(enabledFeatures not reported by this browser)'];
     return {
       enabledFeatures: enabled,
-      missingFeatures: missing,
+      missingFeatures: OPTIONAL_FEATURES.filter((f) => !enabled.includes(f)),
       environmentBlendMode: session.environmentBlendMode,
       referenceSpace: 'local',
       domOverlaySupported: enabled.includes('dom-overlay'),
       hitTestSupported: enabled.includes('hit-test') && typeof session.requestHitTestSource === 'function',
-      anchorsSupported: enabled.includes('anchors'),
-      depthSensingSupported: depthCpu,
       renderScale,
     };
   }
 
-  /**
-   * A viewer-space hit-test source casts a ray from the centre of the screen
-   * every frame; the first result is where the reticle goes.
-   */
   private async setupHitTest(session: XRSession, info: SessionInfo) {
     if (!info.hitTestSupported) return;
     try {
       const viewerSpace = await session.requestReferenceSpace('viewer');
-      const source = await session.requestHitTestSource!({ space: viewerSpace });
-      this.hitTestSource = source ?? null;
+      this.hitTestSource = (await session.requestHitTestSource!({ space: viewerSpace })) ?? null;
     } catch {
       this.hitTestSource = null;
       info.hitTestSupported = false;
     }
   }
+
+  // ----- Frame loop -----
 
   private onFrame = (time: number, frame?: XRFrame) => {
     const renderer = this.renderer;
@@ -416,533 +296,27 @@ export class ArEngine {
       const refSpace = renderer.xr.getReferenceSpace();
       const viewerPose = (refSpace ? frame.getViewerPose(refSpace) : null) ?? null;
       this.updateTracking(viewerPose);
-      if (refSpace) {
-        this.updateTarget(frame, refSpace, viewerPose);
-        if (this.placeRequested) {
-          this.placeRequested = false;
-          if (this.target && viewerPose) this.placeAtTarget(frame, refSpace, viewerPose);
-        }
-        this.updateAnchoredObjects(frame, refSpace);
-      }
+      if (refSpace) this.learnFloor(frame, refSpace);
     }
     this.countFrame(time);
 
     renderer.render(this.scene, this.camera);
   };
 
-  /**
-   * Decides what the reticle points at this frame, depending on mode:
-   *
-   * floor mode: first hit-test result (green when horizontal).
-   * wall mode:  1. a vertical hit-test result (real wall detection)
-   *             2. else a depth-sensing estimate, if the user enabled depth
-   *             3. else a horizontal hit, used to define or snap to the wall line
-   */
-  private updateTarget(frame: XRFrame, refSpace: XRReferenceSpace, viewerPose: XRViewerPose | null) {
-    let hitTarget: Target | null = null;
-    if (this.hitTestSource) {
-      const results = frame.getHitTestResults(this.hitTestSource);
-      const pose = results.length > 0 ? results[0].getPose(refSpace) : null;
-      if (pose) {
-        const q = pose.transform.orientation;
-        const normal = UP.clone().applyQuaternion(new THREE.Quaternion(q.x, q.y, q.z, q.w));
-        const p = pose.transform.position;
-        hitTarget = {
-          position: new THREE.Vector3(p.x, p.y, p.z),
-          normal,
-          surface: classifyNormal(normal),
-          source: 'hit',
-          hit: results[0],
-          hitMatrix: new THREE.Matrix4().fromArray(pose.transform.matrix),
-        };
-      }
-    }
-
-    // Remember the floor height so depth estimates can tell floor from wall.
-    if (hitTarget?.surface === 'horizontal') {
-      this.floorY = this.floorY === null ? hitTarget.position.y : Math.min(this.floorY, hitTarget.position.y);
-    }
-
-    let target: Target | null = hitTarget;
-    if (this.mode === 'wall' && this.depthAvailable && (!hitTarget || hitTarget.surface !== 'vertical')) {
-      const depthTarget = viewerPose ? this.estimateWallFromDepth(frame, viewerPose) : null;
-      if (depthTarget) target = depthTarget;
-    }
-
-    this.target = this.smoothTarget(target);
-    this.applyReticle(this.target, viewerPose);
-  }
-
-  /** Grabs CPU depth info for this frame, or null. Disables depth on failure. */
-  private getDepth(frame: XRFrame, view: XRView): CpuDepthInformation | null {
-    if (!this.depthAvailable) return null;
-    try {
-      return (frame as DepthCapableFrame).getDepthInformation?.(view) ?? null;
-    } catch {
-      // Device said yes to depth-sensing but cannot deliver CPU data.
-      this.depthAvailable = false;
-      this.emit({ type: 'depth', available: false });
-      return null;
-    }
-  }
-
-  /**
-   * Converts a depth sample at normalized view coords (origin top-left) into
-   * a world-space point. Depth is the distance along the camera's view axis.
-   */
-  private unprojectDepth(
-    depth: CpuDepthInformation,
-    x: number,
-    y: number,
-    invProjection: THREE.Matrix4,
-    viewToWorld: THREE.Matrix4,
-  ): THREE.Vector3 | null {
-    let meters: number;
-    try {
-      meters = depth.getDepthInMeters(x, y);
-    } catch {
-      return null;
-    }
-    if (!Number.isFinite(meters) || meters < DEPTH_MIN || meters > DEPTH_MAX) return null;
-    const p = new THREE.Vector3(2 * x - 1, 1 - 2 * y, 0.5).applyMatrix4(invProjection);
-    if (p.z >= 0) return null;
-    p.multiplyScalar(meters / -p.z);
-    return p.applyMatrix4(viewToWorld);
-  }
-
-  /**
-   * Fits a vertical plane through depth samples along the screen's centre
-   * line and returns its normal, pointing toward the camera. Null when the
-   * samples do not line up (corner, furniture in the way, too few samples).
-   */
-  private fitWallNormal(
-    depth: CpuDepthInformation,
-    invProjection: THREE.Matrix4,
-    viewToWorld: THREE.Matrix4,
-    camPos: THREE.Vector3,
-  ): THREE.Vector3 | null {
-    const pts: THREE.Vector3[] = [];
-    for (const x of DEPTH_SAMPLE_XS) {
-      const p = this.unprojectDepth(depth, x, 0.5, invProjection, viewToWorld);
-      if (p) pts.push(p);
-    }
-    if (pts.length < 3) return null;
-
-    let mx = 0;
-    let mz = 0;
-    for (const p of pts) {
-      mx += p.x;
-      mz += p.z;
-    }
-    mx /= pts.length;
-    mz /= pts.length;
-    let sxx = 0;
-    let sxz = 0;
-    let szz = 0;
-    for (const p of pts) {
-      const dx = p.x - mx;
-      const dz = p.z - mz;
-      sxx += dx * dx;
-      sxz += dx * dz;
-      szz += dz * dz;
-    }
-    const theta = 0.5 * Math.atan2(2 * sxz, sxx - szz);
-    const dir = new THREE.Vector2(Math.cos(theta), Math.sin(theta));
-    const perp = new THREE.Vector2(-dir.y, dir.x);
-
-    let minT = Infinity;
-    let maxT = -Infinity;
-    for (const p of pts) {
-      const dx = p.x - mx;
-      const dz = p.z - mz;
-      if (Math.abs(dx * perp.x + dz * perp.y) > WALL_FIT_TOLERANCE) return null;
-      const t = dx * dir.x + dz * dir.y;
-      minT = Math.min(minT, t);
-      maxT = Math.max(maxT, t);
-    }
-    if (maxT - minT < WALL_FIT_MIN_SPAN) return null;
-
-    const normal = new THREE.Vector3(perp.x, 0, perp.y).normalize();
-    if (normal.dot(new THREE.Vector3(camPos.x - mx, 0, camPos.z - mz)) < 0) normal.negate();
-    return normal;
-  }
-
-  /** Estimates a wall under the screen centre from depth sensing (opt-in). */
-  private estimateWallFromDepth(frame: XRFrame, viewerPose: XRViewerPose): Target | null {
-    const view = viewerPose.views[0];
-    if (!view) return null;
-    const depth = this.getDepth(frame, view);
-    if (!depth) return null;
-
-    const invProjection = new THREE.Matrix4().fromArray(view.projectionMatrix).invert();
-    const viewToWorld = new THREE.Matrix4().fromArray(view.transform.matrix);
-    const t = viewerPose.transform.position;
-    const camPos = new THREE.Vector3(t.x, t.y, t.z);
-
-    const center = this.unprojectDepth(depth, 0.5, 0.5, invProjection, viewToWorld);
-    if (!center) return null;
-    if (this.floorY !== null && center.y < this.floorY + 0.25) return null;
-
-    const top = this.unprojectDepth(depth, 0.5, 0.35, invProjection, viewToWorld);
-    const bottom = this.unprojectDepth(depth, 0.5, 0.65, invProjection, viewToWorld);
-    if (top && bottom) {
-      const v = bottom.clone().sub(top);
-      const len = v.length();
-      if (len > 1e-3 && Math.abs(v.y) / len < 0.7) return null;
-    }
-
-    let normal = this.fitWallNormal(depth, invProjection, viewToWorld, camPos);
-    if (!normal) {
-      normal = new THREE.Vector3(camPos.x - center.x, 0, camPos.z - center.z);
-      if (normal.lengthSq() < 1e-4) return null;
-      normal.normalize();
-    }
-    return { position: center, normal, surface: 'vertical', source: 'depth', hit: null, hitMatrix: null };
-  }
-
-  /**
-   * Blends the new target into the previous one so the reticle, and the
-   * pose used for placement, do not jitter with per-frame noise.
-   */
-  private smoothTarget(next: Target | null): Target | null {
-    const prev = this.target;
-    if (!next) return null;
-    if (
-      prev &&
-      prev.source === next.source &&
-      prev.surface === next.surface &&
-      prev.position.distanceTo(next.position) < RETICLE_RESET_DISTANCE
-    ) {
-      prev.position.lerp(next.position, RETICLE_SMOOTHING);
-      prev.normal.lerp(next.normal, RETICLE_SMOOTHING).normalize();
-      prev.hit = next.hit;
-      prev.hitMatrix = next.hitMatrix;
-      return prev;
-    }
-    return next;
-  }
-
-  private applyReticle(target: Target | null, viewerPose: XRViewerPose | null) {
-    let next: ReticleState = { visible: false, surface: null, source: null, distance: null };
-    if (target) {
-      let position = target.position;
-      let normal = target.normal;
-      // With a defined wall, show the reticle snapped onto the wall base line
-      // so the user sees exactly where the TV will go.
-      if (this.mode === 'wall' && this.wallLine && target.surface === 'horizontal') {
-        position = this.projectOntoWallLine(target.position);
-        normal = this.wallLine.normal;
-      }
-      this.reticle.matrix.compose(position, quatWithUpAxis(normal), ONE);
-      let distance: number | null = null;
-      if (viewerPose) {
-        const t = viewerPose.transform.position;
-        const raw = position.distanceTo(new THREE.Vector3(t.x, t.y, t.z));
-        // Coarse buckets: the UI only needs "too close" and a rough readout,
-        // and every reported change re-renders the DOM overlay.
-        distance = raw < TOO_CLOSE_M ? Math.round(raw * 10) / 10 : Math.round(raw * 2) / 2;
-      }
-      next = { visible: true, surface: target.surface, source: target.source, distance };
-    }
-    this.reticle.visible = next.visible;
-
-    const changed =
-      next.visible !== this.reticleState.visible ||
-      next.surface !== this.reticleState.surface ||
-      next.source !== this.reticleState.source ||
-      next.distance !== this.reticleState.distance;
-    if (!changed) return;
-
-    this.reticleState = next;
-    const mat = this.reticleRing.material as THREE.MeshBasicMaterial;
-    const placeable = this.isPlaceable(next);
-    // Green: ready. Blue: depth estimate. Amber: setting up / wrong surface.
-    const colour =
-      next.source === 'depth' ? 0x4f8cff : placeable && (this.mode === 'floor' || this.wallLine || next.surface === 'vertical') ? 0x37c978 : 0xf5b942;
-    mat.color.setHex(colour);
-    this.emit({ type: 'reticle', reticle: next });
-  }
-
-  private isPlaceable(r: ReticleState): boolean {
-    if (!r.visible) return false;
-    if (this.mode === 'floor') return r.surface === 'horizontal' && r.source === 'hit';
-    // Wall mode accepts a wall (real or estimated) or a floor hit (wall line).
-    return r.surface === 'vertical' || r.surface === 'horizontal';
-  }
-
-  private placeAtTarget(frame: XRFrame, refSpace: XRReferenceSpace, viewerPose: XRViewerPose) {
-    const target = this.target!;
-    if (!this.isPlaceable(this.reticleState)) return;
-
-    if (this.mode === 'floor') {
-      // The cube's origin is its bottom centre, so the raw hit pose (+Y up
-      // off the floor) is exactly the pose we want; no offset is needed.
-      const root = new THREE.Group();
-      root.matrixAutoUpdate = false;
-      if (target.hitMatrix) root.matrix.copy(target.hitMatrix);
-      else root.matrix.compose(target.position, quatWithUpAxis(target.normal), ONE);
-      root.add(createCube());
-      const obj: PlacedObject = { root, anchor: null, kind: 'cube', wallMethod: null };
-      this.addPlaced(obj);
-      this.anchorToHit(target.hit, obj);
-      return;
-    }
-
-    // Wall mode.
-    let position: THREE.Vector3;
-    let normal: THREE.Vector3;
-    let method: WallMethod;
-
-    if (target.surface === 'vertical') {
-      position = target.position.clone();
-      normal = target.normal.clone();
-      method = target.source === 'hit' ? 'wall-hit' : 'depth';
-    } else {
-      // Floor hit: either we are still defining the wall, or we snap to it.
-      if (!this.wallLine) {
-        this.addWallPoint(target.position.clone(), viewerPose);
-        return;
-      }
-      position = this.projectOntoWallLine(target.position).add(new THREE.Vector3(0, WALL_TV_HEIGHT, 0));
-      normal = this.wallLine.normal.clone();
-      method = 'wall-line';
-    }
-
-    const quat = quatFacing(normal);
-    const root = new THREE.Group();
-    root.matrixAutoUpdate = false;
-    root.matrix.compose(position, quat, ONE);
-    root.add(createTv());
-    const obj: PlacedObject = { root, anchor: null, kind: 'tv', wallMethod: method };
-    this.lastWallMethod = method;
-    this.addPlaced(obj);
-
-    if (method === 'wall-hit' && target.hitMatrix) {
-      // The anchor will take the hit pose (+Y = wall normal), not the TV
-      // pose (+Z = wall normal), so the TV is parented with the offset.
-      this.anchorToHit(target.hit, obj, { hitMatrix: target.hitMatrix, position, quat });
-    } else {
-      this.anchorToPose(frame, refSpace, obj, position, quat);
-    }
-  }
-
-  // ----- Manual wall line -----
-
-  private addWallPoint(point: THREE.Vector3, viewerPose: XRViewerPose) {
-    if (!this.wallFirstPoint) {
-      this.wallFirstPoint = point;
-      this.addMarker(point);
-      this.setWallSetup('first-point');
-      return;
-    }
-
-    const a = this.wallFirstPoint;
-    const dir = new THREE.Vector3(point.x - a.x, 0, point.z - a.z);
-    if (dir.length() < WALL_MIN_SPAN) {
-      // Too close to the first point to know the wall direction; ignore.
-      return;
-    }
-    dir.normalize();
-    // Normal perpendicular to the base line, pointing toward the user.
-    const normal = new THREE.Vector3(-dir.z, 0, dir.x);
-    const cam = viewerPose.transform.position;
-    const toCam = new THREE.Vector3(cam.x - a.x, 0, cam.z - a.z);
-    if (normal.dot(toCam) < 0) normal.negate();
-
-    const base = new THREE.Vector3(a.x, Math.min(a.y, point.y), a.z);
-    this.wallLine = { point: base, dir, normal };
-    this.wallFirstPoint = null;
-    this.addMarker(point);
-    this.addWallVisual(base, point, dir, normal);
-    this.setWallSetup('defined');
-  }
-
-  /** Foot of the perpendicular from `p` to the wall base line (in XZ). */
-  private projectOntoWallLine(p: THREE.Vector3): THREE.Vector3 {
-    const w = this.wallLine!;
-    const rel = new THREE.Vector3(p.x - w.point.x, 0, p.z - w.point.z);
-    const t = rel.dot(w.dir);
-    return new THREE.Vector3(w.point.x + w.dir.x * t, w.point.y, w.point.z + w.dir.z * t);
-  }
-
-  private addMarker(point: THREE.Vector3) {
-    const m = new THREE.Mesh(this.markerGeometry, this.markerMaterial);
-    m.position.copy(point);
-    this.wallMarkers.add(m);
-  }
-
-  /** Faint translucent wall and a base line so the user can judge alignment. */
-  private addWallVisual(a: THREE.Vector3, b: THREE.Vector3, dir: THREE.Vector3, normal: THREE.Vector3) {
-    const span = Math.max(3, a.distanceTo(b) + 1.5);
-    const height = 2.4;
-    const mid = a.clone().add(b).multiplyScalar(0.5);
-    mid.y = a.y;
-    const quat = quatFacing(normal);
-
-    const base = new THREE.Mesh(new THREE.BoxGeometry(span, 0.01, 0.01), this.wallBaseMaterial);
-    base.position.copy(mid);
-    base.quaternion.copy(quat);
-
-    const plane = new THREE.Mesh(new THREE.PlaneGeometry(span, height), this.wallPlaneMaterial);
-    plane.position.copy(mid).add(new THREE.Vector3(0, height / 2, 0));
-    plane.quaternion.copy(quat);
-    plane.renderOrder = -1;
-
-    this.wallMarkers.add(base, plane);
-    void dir;
-  }
-
-  private clearWallMarkers() {
-    for (const child of [...this.wallMarkers.children]) {
-      this.wallMarkers.remove(child);
-      const mesh = child as THREE.Mesh;
-      // Shared marker geometry/material stay; per-wall visuals are disposed.
-      if (mesh.geometry !== this.markerGeometry) mesh.geometry.dispose();
-    }
-  }
-
-  private setWallSetup(state: WallSetupState) {
-    if (state === this.wallSetup) return;
-    this.wallSetup = state;
-    this.emit({ type: 'wall', state });
-  }
-
-  // ----- Objects and anchors -----
-
-  private addPlaced(obj: PlacedObject) {
-    this.scene.add(obj.root);
-    this.placed.push(obj);
-    this.emitObjects();
-  }
-
-  /**
-   * Anchors `obj` to a hit-test result. When the object's pose differs from
-   * the hit pose, the model is re-parented with the offset so that the root
-   * can track the anchor directly.
-   */
-  private anchorToHit(
-    hit: XRHitTestResult | null,
-    obj: PlacedObject,
-    desired?: { hitMatrix: THREE.Matrix4; position: THREE.Vector3; quat: THREE.Quaternion },
-  ) {
-    const anchorable = hit as AnchorCapableHit | null;
-    if (!this.anchorsAvailable || !anchorable || typeof anchorable.createAnchor !== 'function') return;
-
-    if (desired) {
-      // root will follow the anchor, whose pose is the HIT pose. Put the
-      // model under an inner group carrying hitPose^-1 * desiredPose so the
-      // world result is the desired pose, and start root at the hit pose so
-      // nothing moves when the anchor resolves.
-      const desiredM = new THREE.Matrix4().compose(desired.position, desired.quat, ONE);
-      const offset = new THREE.Matrix4().copy(desired.hitMatrix).invert().multiply(desiredM);
-      const inner = new THREE.Group();
-      inner.matrixAutoUpdate = false;
-      inner.matrix.copy(offset);
-      for (const child of [...obj.root.children]) inner.add(child);
-      obj.root.add(inner);
-      obj.root.matrix.copy(desired.hitMatrix);
-    }
-
-    anchorable
-      .createAnchor()
-      .then((anchor) => this.attachAnchor(obj, anchor))
-      .catch(() => {
-        // Anchor failed: the object keeps its static pose.
-      });
-  }
-
-  /** Anchors `obj` at an arbitrary pose (depth or wall-line placements). */
-  private anchorToPose(
-    frame: XRFrame,
-    refSpace: XRReferenceSpace,
-    obj: PlacedObject,
-    position: THREE.Vector3,
-    quat: THREE.Quaternion,
-  ) {
-    const f = frame as AnchorCapableFrame;
-    if (!this.anchorsAvailable || typeof f.createAnchor !== 'function') return;
-    try {
-      const transform = new XRRigidTransform(
-        { x: position.x, y: position.y, z: position.z, w: 1 },
-        { x: quat.x, y: quat.y, z: quat.z, w: quat.w },
-      );
-      f.createAnchor(transform, refSpace)
-        .then((anchor) => this.attachAnchor(obj, anchor))
-        .catch(() => {
-          // Keep static pose.
-        });
-    } catch {
-      // XRRigidTransform or createAnchor unavailable: keep static pose.
-    }
-  }
-
-  private attachAnchor(obj: PlacedObject, anchor: XRAnchor) {
-    if (!this.placed.includes(obj)) {
-      anchor.delete();
-      return;
-    }
-    obj.anchor = anchor;
-    this.emitObjects();
-  }
-
-  /**
-   * Follows each object's anchor, but calmly: corrections smaller than the
-   * deadband are ignored (they are tracking noise, and applying them makes
-   * objects shiver), larger ones are blended in over several frames, and
-   * nothing moves while tracking is not solid. If an anchor is momentarily
-   * untracked the object keeps its last pose rather than vanishing.
-   */
-  private updateAnchoredObjects(frame: XRFrame, refSpace: XRReferenceSpace) {
-    if (this.trackingState !== 'tracking') return;
-    const anchorPos = new THREE.Vector3();
-    const anchorQuat = new THREE.Quaternion();
-    const curPos = new THREE.Vector3();
-    const curQuat = new THREE.Quaternion();
-    const scale = new THREE.Vector3();
-
-    for (const obj of this.placed) {
-      if (!obj.anchor) continue;
-      const pose = frame.getPose(obj.anchor.anchorSpace, refSpace);
-      if (!pose) continue;
-
-      const p = pose.transform.position;
-      const q = pose.transform.orientation;
-      anchorPos.set(p.x, p.y, p.z);
-      anchorQuat.set(q.x, q.y, q.z, q.w);
-      obj.root.matrix.decompose(curPos, curQuat, scale);
-
-      const moved = curPos.distanceTo(anchorPos);
-      const turned = curQuat.angleTo(anchorQuat);
-      if (moved < ANCHOR_DEADBAND_M && turned < ANCHOR_DEADBAND_RAD) continue;
-
-      // Large jumps (relocalisation) snap; small corrections ease in.
-      const t = moved > ANCHOR_SNAP_M ? 1 : ANCHOR_SMOOTHING;
-      curPos.lerp(anchorPos, t);
-      curQuat.slerp(anchorQuat, t);
-      obj.root.matrix.compose(curPos, curQuat, ONE);
-    }
-  }
-
-  private emitObjects() {
-    this.emit({
-      type: 'objects',
-      count: this.placed.length,
-      anchored: this.placed.filter((o) => o.anchor !== null).length,
-      lastWallMethod: this.lastWallMethod,
-    });
-  }
-
-  private onSelect = () => {
-    // Screen tap outside the overlay controls (controls call preventDefault
-    // on beforexrselect, so they never reach here).
-    this.placeRequested = true;
-  };
-
-  /** Turn the once-a-second fps report on or off (it re-renders the overlay). */
-  setStatsEnabled(enabled: boolean): void {
-    this.statsEnabled = enabled;
-    this.frameCount = 0;
-    this.fpsWindowStart = 0;
+  /** Keeps the lowest horizontal hit seen so floor objects spawn on the floor. */
+  private learnFloor(frame: XRFrame, refSpace: XRReferenceSpace) {
+    if (!this.hitTestSource) return;
+    const results = frame.getHitTestResults(this.hitTestSource);
+    if (results.length === 0) return;
+    const pose = results[0].getPose(refSpace);
+    if (!pose) return;
+    const q = pose.transform.orientation;
+    const normal = UP.clone().applyQuaternion(new THREE.Quaternion(q.x, q.y, q.z, q.w));
+    if (normal.y < 0.75) return;
+    const y = pose.transform.position.y;
+    const wasKnown = this.floorY !== null;
+    this.floorY = wasKnown ? Math.min(this.floorY!, y) : y;
+    if (!wasKnown) this.emit({ type: 'floor', known: true });
   }
 
   private countFrame(time: number) {
@@ -960,9 +334,8 @@ export class ArEngine {
 
   /**
    * Tracking state with hysteresis: a good pose switches to "tracking" at
-   * once, but "limited" and "lost" only after the condition persists for a
-   * number of frames, so a brief dropout near a plain wall does not flash
-   * the status and alarm the user.
+   * once, but "limited" and "lost" only after the condition persists, so a
+   * brief dropout near a plain wall does not flash the status.
    */
   private updateTracking(pose: XRViewerPose | null) {
     if (!pose) {
@@ -991,6 +364,418 @@ export class ArEngine {
     }
   }
 
+  // ----- Camera helpers -----
+
+  /** World-space camera position and horizontal forward/right directions. */
+  private cameraFrame(): { position: THREE.Vector3; forward: THREE.Vector3; right: THREE.Vector3 } | null {
+    if (!this.renderer) return null;
+    const cam = this.renderer.xr.getCamera();
+    const position = new THREE.Vector3().setFromMatrixPosition(cam.matrixWorld);
+    const quat = new THREE.Quaternion().setFromRotationMatrix(cam.matrixWorld);
+    const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(quat);
+    forward.y = 0;
+    if (forward.lengthSq() < 1e-6) forward.set(0, 0, -1);
+    forward.normalize();
+    const right = new THREE.Vector3().crossVectors(forward, UP).normalize();
+    return { position, forward, right };
+  }
+
+  private rayFromScreen(x: number, y: number): THREE.Ray | null {
+    if (!this.renderer) return null;
+    const cam = this.renderer.xr.getCamera();
+    this.raycaster.setFromCamera(new THREE.Vector2(x * 2 - 1, -(y * 2 - 1)), cam);
+    return this.raycaster.ray.clone();
+  }
+
+  // ----- Objects -----
+
+  /** Creates an object about 1.5 m in front of the user, facing them. */
+  spawn(kind: ObjectKind): string | null {
+    const cam = this.cameraFrame();
+    if (!cam) return null;
+    const spec = getModelSpec(kind);
+
+    const position = cam.position.clone().addScaledVector(cam.forward, SPAWN_DISTANCE);
+    if (spec.spawn === 'floor') {
+      position.y = this.floorY ?? cam.position.y - FLOOR_BELOW_EYE_FALLBACK;
+    } else {
+      position.y = cam.position.y - TV_SPAWN_BELOW_EYE;
+    }
+    const quaternion = quatFacing(cam.forward.clone().negate());
+
+    const obj = this.createObject(kind, { position, quaternion, scale: 1 });
+    this.pushUndo({ type: 'add', id: obj.id });
+    this.selectedId = obj.id;
+    this.updateOutlines();
+    this.emitObjects();
+    return obj.id;
+  }
+
+  private createObject(kind: ObjectKind, t: Transform): SceneObject {
+    const spec = getModelSpec(kind);
+    const root = new THREE.Group();
+    root.name = `object-${this.nextId}`;
+    const model = spec.build();
+    root.add(model);
+
+    // Selection outline: the model's bounding box as yellow edges.
+    const box = new THREE.Box3().setFromObject(model);
+    const size = new THREE.Vector3();
+    const center = new THREE.Vector3();
+    box.getSize(size);
+    box.getCenter(center);
+    const outline = new THREE.LineSegments(
+      new THREE.EdgesGeometry(new THREE.BoxGeometry(size.x + 0.02, size.y + 0.02, size.z + 0.02)),
+      this.outlineMaterial,
+    );
+    outline.position.copy(center);
+    outline.visible = false;
+    root.add(outline);
+
+    root.position.copy(t.position);
+    root.quaternion.copy(t.quaternion);
+    root.scale.setScalar(t.scale);
+    this.scene.add(root);
+
+    const obj: SceneObject = { id: String(this.nextId++), kind, spawn: spec.spawn, root, outline };
+    root.userData.objectId = obj.id;
+    this.objects.push(obj);
+    return obj;
+  }
+
+  private findObject(id: string | null): SceneObject | null {
+    if (!id) return null;
+    return this.objects.find((o) => o.id === id) ?? null;
+  }
+
+  private get selected(): SceneObject | null {
+    return this.findObject(this.selectedId);
+  }
+
+  select(id: string | null): void {
+    if (id !== null && !this.findObject(id)) return;
+    if (id === this.selectedId) return;
+    this.selectedId = id;
+    this.updateOutlines();
+    this.emitObjects();
+  }
+
+  private updateOutlines() {
+    for (const o of this.objects) o.outline.visible = o.id === this.selectedId;
+  }
+
+  private snapshot(obj: SceneObject): Transform {
+    return { position: obj.root.position.clone(), quaternion: obj.root.quaternion.clone(), scale: obj.root.scale.x };
+  }
+
+  private applyTransform(obj: SceneObject, t: Transform) {
+    obj.root.position.copy(t.position);
+    obj.root.quaternion.copy(t.quaternion);
+    obj.root.scale.setScalar(t.scale);
+  }
+
+  private clampPosition(obj: SceneObject) {
+    const cam = this.cameraFrame();
+    if (!cam) return;
+    const d = obj.root.position.distanceTo(cam.position);
+    if (d > MAX_DISTANCE) {
+      obj.root.position.sub(cam.position).multiplyScalar(MAX_DISTANCE / d).add(cam.position);
+    }
+  }
+
+  /**
+   * Moves the selected object by metres along the user's right (x), up (y)
+   * and forward (z) directions, so "left" always means the user's left.
+   */
+  nudge(dx: number, dy: number, dz: number): void {
+    const obj = this.selected;
+    const cam = this.cameraFrame();
+    if (!obj || !cam) return;
+    this.pushUndo({ type: 'transform', id: obj.id, before: this.snapshot(obj) });
+    obj.root.position.addScaledVector(cam.right, dx).addScaledVector(UP, dy).addScaledVector(cam.forward, dz);
+    this.clampPosition(obj);
+  }
+
+  /** Rotates the selected object around its vertical axis by degrees. */
+  rotate(degrees: number): void {
+    const obj = this.selected;
+    if (!obj) return;
+    this.pushUndo({ type: 'transform', id: obj.id, before: this.snapshot(obj) });
+    obj.root.rotateOnWorldAxis(UP, THREE.MathUtils.degToRad(degrees));
+  }
+
+  /** Turns the selected object to face the user squarely. */
+  faceUser(): void {
+    const obj = this.selected;
+    const cam = this.cameraFrame();
+    if (!obj || !cam) return;
+    this.pushUndo({ type: 'transform', id: obj.id, before: this.snapshot(obj) });
+    const toCam = cam.position.clone().sub(obj.root.position);
+    obj.root.quaternion.copy(quatFacing(toCam));
+  }
+
+  /** Multiplies the selected object's size. */
+  scaleBy(factor: number): void {
+    const obj = this.selected;
+    if (!obj) return;
+    this.pushUndo({ type: 'transform', id: obj.id, before: this.snapshot(obj) });
+    const s = THREE.MathUtils.clamp(obj.root.scale.x * factor, MIN_SCALE, MAX_SCALE);
+    obj.root.scale.setScalar(s);
+  }
+
+  /** Copies the selected object beside itself (to the user's right). */
+  duplicate(): void {
+    const obj = this.selected;
+    const cam = this.cameraFrame();
+    if (!obj || !cam) return;
+    const box = new THREE.Box3().setFromObject(obj.root);
+    const width = box.getSize(new THREE.Vector3()).x || 0.5;
+    const t = this.snapshot(obj);
+    t.position.addScaledVector(cam.right, width + 0.1);
+    const copy = this.createObject(obj.kind, t);
+    this.pushUndo({ type: 'add', id: copy.id });
+    this.selectedId = copy.id;
+    this.updateOutlines();
+    this.emitObjects();
+  }
+
+  deleteSelected(): void {
+    const obj = this.selected;
+    if (!obj) return;
+    this.pushUndo({ type: 'delete', id: obj.id, kind: obj.kind, before: this.snapshot(obj) });
+    this.removeObject(obj);
+    this.selectedId = null;
+    this.emitObjects();
+  }
+
+  clearAll(): void {
+    for (const obj of [...this.objects]) this.removeObject(obj);
+    this.selectedId = null;
+    this.undoStack = [];
+    this.gesture = null;
+    this.emitObjects();
+  }
+
+  private removeObject(obj: SceneObject) {
+    this.scene.remove(obj.root);
+    obj.outline.geometry.dispose();
+    this.objects = this.objects.filter((o) => o !== obj);
+  }
+
+  // ----- Undo -----
+
+  get canUndo(): boolean {
+    return this.undoStack.length > 0;
+  }
+
+  private pushUndo(entry: UndoEntry) {
+    this.undoStack.push(entry);
+    if (this.undoStack.length > UNDO_LIMIT) this.undoStack.shift();
+  }
+
+  undo(): void {
+    const entry = this.undoStack.pop();
+    if (!entry) return;
+    switch (entry.type) {
+      case 'transform': {
+        const obj = this.findObject(entry.id);
+        if (obj) this.applyTransform(obj, entry.before);
+        break;
+      }
+      case 'add': {
+        const obj = this.findObject(entry.id);
+        if (obj) {
+          this.removeObject(obj);
+          if (this.selectedId === obj.id) this.selectedId = null;
+        }
+        break;
+      }
+      case 'delete': {
+        // Recreate with a fresh id; the old id is gone.
+        const obj = this.createObject(entry.kind, entry.before);
+        this.selectedId = obj.id;
+        this.updateOutlines();
+        break;
+      }
+    }
+    this.emitObjects();
+  }
+
+  private emitObjects() {
+    const objects: ObjectSummary[] = this.objects.map((o) => ({ id: o.id, kind: o.kind }));
+    this.emit({ type: 'objects', objects, selectedId: this.selectedId });
+  }
+
+  // ----- Gestures -----
+
+  /**
+   * One finger: tap an object to select it; drag a selected object to slide
+   * it (floor objects on the floor plane, wall objects on a plane facing the
+   * user). Tap empty space to deselect.
+   * Two fingers on a selected object: pinch to resize, twist to rotate,
+   * move both fingers up/down to push the object away or pull it closer.
+   */
+  handleGesture(e: GestureEvent): void {
+    if (!this.renderer) return;
+
+    if (e.type === 'down') {
+      this.pointers.set(e.id, { x: e.x, y: e.y });
+      if (this.pointers.size === 1) this.beginOneFinger(e);
+      else if (this.pointers.size === 2) this.beginTwoFinger();
+      return;
+    }
+
+    if (e.type === 'move') {
+      if (!this.pointers.has(e.id)) return;
+      this.pointers.set(e.id, { x: e.x, y: e.y });
+      if (this.gesture?.kind === 'drag' && this.gesture.pointerId === e.id) this.moveDrag(e);
+      else if (this.gesture?.kind === 'two' && this.pointers.size === 2) this.moveTwoFinger();
+      else if (this.gesture?.kind === 'tap-empty' && this.gesture.pointerId === e.id) {
+        if (Math.hypot(e.x - this.gesture.startX, e.y - this.gesture.startY) > TAP_SLOP) this.gesture.moved = true;
+      }
+      return;
+    }
+
+    // up / cancel
+    const wasTapEmpty = this.gesture?.kind === 'tap-empty' && !this.gesture.moved && e.type === 'up';
+    this.pointers.delete(e.id);
+    if (wasTapEmpty) this.select(null);
+    if (this.pointers.size === 0) this.gesture = null;
+    else if (this.pointers.size === 1 && this.gesture?.kind === 'two') {
+      // Lifted one of two fingers: stop the two-finger gesture, no new drag
+      // until the remaining finger is lifted too.
+      this.gesture = null;
+    }
+  }
+
+  private beginOneFinger(e: GestureEvent) {
+    const ray = this.rayFromScreen(e.x, e.y);
+    if (!ray) return;
+    const hitObj = this.pickObject(ray);
+    if (!hitObj) {
+      this.gesture = { kind: 'tap-empty', pointerId: e.id, startX: e.x, startY: e.y, moved: false };
+      return;
+    }
+    if (hitObj.id !== this.selectedId) this.select(hitObj.id);
+
+    const plane =
+      hitObj.spawn === 'floor'
+        ? new THREE.Plane(UP.clone(), -hitObj.root.position.y)
+        : this.planeFacingUser(hitObj.root.position);
+    const hitPoint = new THREE.Vector3();
+    if (!ray.intersectPlane(plane, hitPoint)) {
+      this.gesture = null;
+      return;
+    }
+    this.gesture = {
+      kind: 'drag',
+      pointerId: e.id,
+      objectId: hitObj.id,
+      plane,
+      grabOffset: hitPoint.sub(hitObj.root.position),
+      startX: e.x,
+      startY: e.y,
+      moved: false,
+      undoPushed: false,
+    };
+  }
+
+  /** Vertical plane through `point`, perpendicular to the user's view direction. */
+  private planeFacingUser(point: THREE.Vector3): THREE.Plane {
+    const cam = this.cameraFrame();
+    const normal = cam ? cam.forward.clone().negate() : new THREE.Vector3(0, 0, 1);
+    return new THREE.Plane().setFromNormalAndCoplanarPoint(normal, point);
+  }
+
+  private pickObject(ray: THREE.Ray): SceneObject | null {
+    this.raycaster.ray.copy(ray);
+    const roots = this.objects.map((o) => o.root);
+    const hits = this.raycaster.intersectObjects(roots, true);
+    for (const hit of hits) {
+      let node: THREE.Object3D | null = hit.object;
+      while (node && node.userData.objectId === undefined) node = node.parent;
+      if (node) {
+        const obj = this.findObject(node.userData.objectId as string);
+        if (obj) return obj;
+      }
+    }
+    return null;
+  }
+
+  private moveDrag(e: GestureEvent) {
+    const g = this.gesture;
+    if (g?.kind !== 'drag') return;
+    const obj = this.findObject(g.objectId);
+    if (!obj) return;
+    if (!g.moved && Math.hypot(e.x - g.startX, e.y - g.startY) <= TAP_SLOP) return;
+    g.moved = true;
+    if (!g.undoPushed) {
+      this.pushUndo({ type: 'transform', id: obj.id, before: this.snapshot(obj) });
+      g.undoPushed = true;
+    }
+    const ray = this.rayFromScreen(e.x, e.y);
+    if (!ray) return;
+    const hitPoint = new THREE.Vector3();
+    if (!ray.intersectPlane(g.plane, hitPoint)) return;
+    obj.root.position.copy(hitPoint.sub(g.grabOffset));
+    this.clampPosition(obj);
+  }
+
+  private twoFingerStats(): { distance: number; angle: number; midY: number } | null {
+    const pts = [...this.pointers.values()];
+    if (pts.length < 2) return null;
+    const dx = (pts[1].x - pts[0].x) * window.innerWidth;
+    const dy = (pts[1].y - pts[0].y) * window.innerHeight;
+    return { distance: Math.hypot(dx, dy), angle: Math.atan2(dy, dx), midY: (pts[0].y + pts[1].y) / 2 };
+  }
+
+  private beginTwoFinger() {
+    const obj = this.selected;
+    const stats = this.twoFingerStats();
+    const cam = this.cameraFrame();
+    if (!obj || !stats || !cam) {
+      this.gesture = null;
+      return;
+    }
+    this.pushUndo({ type: 'transform', id: obj.id, before: this.snapshot(obj) });
+    this.gesture = {
+      kind: 'two',
+      objectId: obj.id,
+      startDistance: Math.max(stats.distance, 1),
+      startAngle: stats.angle,
+      startMidY: stats.midY,
+      startScale: obj.root.scale.x,
+      startQuaternion: obj.root.quaternion.clone(),
+      startPosition: obj.root.position.clone(),
+      forward: cam.forward.clone(),
+    };
+  }
+
+  private moveTwoFinger() {
+    const g = this.gesture;
+    if (g?.kind !== 'two') return;
+    const obj = this.findObject(g.objectId);
+    const stats = this.twoFingerStats();
+    if (!obj || !stats) return;
+
+    // Pinch: size.
+    const s = THREE.MathUtils.clamp(g.startScale * (stats.distance / g.startDistance), MIN_SCALE, MAX_SCALE);
+    obj.root.scale.setScalar(s);
+
+    // Twist: rotation about the vertical axis. Screen y points down, so a
+    // clockwise twist on screen is a negative angle change here.
+    const twist = -(stats.angle - g.startAngle);
+    obj.root.quaternion.copy(g.startQuaternion);
+    obj.root.rotateOnWorldAxis(UP, twist);
+
+    // Both fingers up/down: push away / pull closer along the view direction.
+    const push = -(stats.midY - g.startMidY) * PUSH_PER_SCREEN;
+    obj.root.position.copy(g.startPosition).addScaledVector(g.forward, push);
+    this.clampPosition(obj);
+  }
+
+  // ----- Session end -----
+
   private onVisibilityChange = () => {
     if (!this.session) return;
     this.emit({ type: 'visibility', state: this.session.visibilityState });
@@ -1001,7 +786,6 @@ export class ArEngine {
     if (session) {
       session.removeEventListener('end', this.onSessionEnd);
       session.removeEventListener('visibilitychange', this.onVisibilityChange);
-      session.removeEventListener('select', this.onSelect);
     }
     this.session = null;
     this.cleanupSession();
@@ -1009,26 +793,17 @@ export class ArEngine {
   };
 
   private cleanupSession() {
-    // Placed objects do not survive the session: their poses are relative
-    // to this session's tracking origin and anchors die with the session.
-    for (const obj of this.placed) {
-      this.scene.remove(obj.root);
-      obj.anchor?.delete();
-    }
-    this.placed = [];
-    this.lastWallMethod = null;
-
-    this.wallFirstPoint = null;
-    this.wallLine = null;
-    this.clearWallMarkers();
-    this.wallSetup = 'none';
+    // Objects do not survive the session: their poses are relative to this
+    // session's tracking origin. Phase 6 adds export/import of the layout.
+    for (const obj of [...this.objects]) this.removeObject(obj);
+    this.selectedId = null;
+    this.undoStack = [];
+    this.pointers.clear();
+    this.gesture = null;
 
     this.hitTestSource?.cancel();
     this.hitTestSource = null;
-    this.target = null;
     this.floorY = null;
-    this.reticle.visible = false;
-    this.reticleState = { visible: false, surface: null, source: null, distance: null };
 
     if (this.renderer) {
       this.renderer.setAnimationLoop(null);

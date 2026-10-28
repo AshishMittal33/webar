@@ -1,12 +1,7 @@
-import { useEffect, useRef, useState } from 'react';
-import type {
-  PlacementMode,
-  ReticleState,
-  SessionInfo,
-  TrackingState,
-  WallMethod,
-  WallSetupState,
-} from '../ar/types';
+import { useEffect, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react';
+import type { GestureEvent } from '../ar/ArEngine';
+import { CATALOGUE } from '../ar/models';
+import type { ObjectKind, ObjectSummary, SessionInfo, TrackingState } from '../ar/types';
 
 interface ArOverlayProps {
   tracking: TrackingState;
@@ -14,17 +9,21 @@ interface ArOverlayProps {
   visibility: XRVisibilityState;
   /** Rendered frames per second, updated once a second. 0 until measured. */
   fps: number;
-  mode: PlacementMode;
-  reticle: ReticleState;
-  depthAvailable: boolean;
-  wallSetup: WallSetupState;
-  objectCount: number;
-  anchoredCount: number;
-  lastWallMethod: WallMethod | null;
-  onModeChange: (mode: PlacementMode) => void;
-  onPlace: () => void;
-  onResetWall: () => void;
+  floorKnown: boolean;
+  objects: ObjectSummary[];
+  selectedId: string | null;
+  canUndo: boolean;
+  onSpawn: (kind: ObjectKind) => void;
+  onNudge: (dx: number, dy: number, dz: number) => void;
+  onRotate: (degrees: number) => void;
+  onFaceUser: () => void;
+  onScale: (factor: number) => void;
+  onDuplicate: () => void;
+  onDelete: () => void;
+  onDeselect: () => void;
+  onUndo: () => void;
   onClear: () => void;
+  onGesture: (e: GestureEvent) => void;
   onExit: () => void;
   /** Called when the details panel opens or closes (fps stats cost redraws). */
   onStatsToggle: (open: boolean) => void;
@@ -39,88 +38,47 @@ const TRACKING_LABEL: Record<TrackingState, string> = {
   lost: 'Lost',
 };
 
-const WALL_METHOD_LABEL: Record<WallMethod, string> = {
-  'wall-hit': 'detected wall',
-  depth: 'depth estimate',
-  'wall-line': 'wall set by two floor points',
-};
+/** Step sizes for the precise buttons. */
+const STEP_M = 0.05;
+const STEP_DEG = 10;
+const STEP_SCALE = 1.1;
 
-/** Closer than this to the target, ARCore tends to lose its features. */
-const TOO_CLOSE = 0.7;
-
-function guidance(
-  mode: PlacementMode,
-  tracking: TrackingState,
-  r: ReticleState,
-  wall: WallSetupState,
-  hitTest: boolean,
-): string {
+function guidance(tracking: TrackingState, hasObjects: boolean, hasSelection: boolean): string {
   if (tracking === 'initializing') return 'Move your phone slowly over the floor to scan the area.';
   if (tracking === 'lost')
-    return 'Tracking lost: the camera sees only plain wall. Tilt down so the floor is in view, step back, add light.';
-  if (tracking === 'limited')
-    return 'Tracking is limited, usually from being too close to a plain wall. Step back and keep some floor in view.';
-  if (!hitTest) return 'This device did not grant hit-testing, so surfaces cannot be detected.';
-  if (r.visible && r.distance !== null && r.distance < TOO_CLOSE)
-    return 'Too close. Step back a little so the camera can keep tracking.';
-
-  if (mode === 'floor') {
-    if (!r.visible) return 'Aim at the floor to place furniture. If nothing appears, move slowly or try another angle.';
-    if (r.surface === 'horizontal') return 'Floor detected. Tap the screen or press Place.';
-    if (r.surface === 'vertical') return 'That is a wall. Switch to Wall mode for a TV, or aim at the floor.';
-    return 'Sloped surface. Aim at a flat floor to place.';
-  }
-
-  // Wall mode.
-  if (r.visible && r.surface === 'vertical' && r.source === 'hit')
-    return 'Wall detected. Tap the screen or press Place to mount the TV.';
-  if (r.visible && r.surface === 'vertical' && r.source === 'depth')
-    return 'Wall estimated from depth. Hold still for a second, then press Place.';
-
-  if (wall === 'none')
-    return 'Stand 2 m back. Aim at the line where the wall meets the floor and press "Set wall point 1".';
-  if (wall === 'first-point')
-    return 'Now aim further along the same wall base, at least half a metre away, and press "Set wall point 2".';
-  if (!r.visible) return 'Wall is set. Aim at the floor near the wall to position the TV.';
-  if (r.surface === 'horizontal') return 'Aim at the floor below where you want the TV, then press Place TV. It snaps onto the wall.';
-  return 'Aim at the floor near the wall.';
-}
-
-function canPlace(mode: PlacementMode, r: ReticleState): boolean {
-  if (!r.visible) return false;
-  if (mode === 'floor') return r.surface === 'horizontal' && r.source === 'hit';
-  return r.surface === 'vertical' || r.surface === 'horizontal';
-}
-
-function placeLabel(mode: PlacementMode, r: ReticleState, wall: WallSetupState): string {
-  if (mode === 'floor') return 'Place cube';
-  if (r.visible && r.surface === 'vertical') return 'Place TV';
-  if (wall === 'none') return 'Set wall point 1';
-  if (wall === 'first-point') return 'Set wall point 2';
-  return 'Place TV';
+    return 'Tracking lost: the camera sees only plain surfaces. Tilt down so the floor is in view and move slowly.';
+  if (tracking === 'limited') return 'Tracking is limited. Step back and keep some floor or furniture in view.';
+  if (!hasObjects) return 'Tap + TV or + Box to add an object in front of you.';
+  if (!hasSelection) return 'Tap an object to select it.';
+  return 'Drag to move. Pinch to resize. Twist two fingers to rotate. Two fingers up/down to push or pull.';
 }
 
 /**
  * UI drawn on top of the camera feed through the WebXR dom-overlay feature.
- * Everything interactive calls preventDefault on "beforexrselect" so taps on
- * buttons never reach the XR session as placement taps.
+ * The gesture layer covers the whole screen behind the controls and turns
+ * pointer events into engine gestures. Everything here calls preventDefault
+ * on "beforexrselect" so taps never reach the XR session.
  */
 export default function ArOverlay({
   tracking,
   info,
   visibility,
   fps,
-  mode,
-  reticle,
-  depthAvailable,
-  wallSetup,
-  objectCount,
-  anchoredCount,
-  lastWallMethod,
-  onModeChange,
-  onPlace,
-  onResetWall,
+  floorKnown,
+  objects,
+  selectedId,
+  canUndo,
+  onSpawn,
+  onNudge,
+  onRotate,
+  onFaceUser,
+  onScale,
+  onDuplicate,
+  onDelete,
+  onDeselect,
+  onUndo,
   onClear,
+  onGesture,
   onExit,
   onStatsToggle,
   previewMode,
@@ -141,11 +99,24 @@ export default function ArOverlay({
   }, []);
 
   const paused = visibility !== 'visible';
-  const hitTest = info?.hitTestSupported ?? previewMode ?? false;
-  const placeable = !paused && tracking === 'tracking' && canPlace(mode, reticle);
+  const selected = objects.find((o) => o.id === selectedId) ?? null;
+  const selectedIndex = selected ? objects.indexOf(selected) + 1 : 0;
+
+  const gesture = (type: GestureEvent['type']) => (e: ReactPointerEvent<HTMLDivElement>) => {
+    if (type === 'down') e.currentTarget.setPointerCapture(e.pointerId);
+    onGesture({ type, id: e.pointerId, x: e.clientX / window.innerWidth, y: e.clientY / window.innerHeight });
+  };
 
   return (
     <div className={`ar-ui${previewMode ? ' preview' : ''}`} ref={uiRef}>
+      <div
+        className="ar-gesture"
+        onPointerDown={gesture('down')}
+        onPointerMove={gesture('move')}
+        onPointerUp={gesture('up')}
+        onPointerCancel={gesture('cancel')}
+      />
+
       {previewMode && <div className="ar-banner">UI preview only. No AR session is running.</div>}
 
       <header className="ar-top">
@@ -172,21 +143,8 @@ export default function ArOverlay({
               <div className="hint">
                 Not granted: {info.missingFeatures.length ? info.missingFeatures.join(', ') : 'none'}
               </div>
-              <div className="hint">Hit-test: {info.hitTestSupported ? 'active' : 'unavailable'}</div>
-              <div className="hint">
-                Anchors: {info.anchorsSupported ? `supported (${anchoredCount}/${objectCount} anchored)` : 'unavailable'}
-              </div>
-              <div className="hint">Depth sensing: {depthAvailable ? 'active' : 'off'}</div>
-              <div className="hint">
-                Reticle:{' '}
-                {reticle.visible
-                  ? `${reticle.surface} via ${reticle.source}${reticle.distance !== null ? `, ${reticle.distance} m` : ''}`
-                  : 'none'}
-              </div>
-              <div className="hint">Wall setup: {wallSetup}</div>
-              <div className="hint">
-                Last wall placement: {lastWallMethod ? WALL_METHOD_LABEL[lastWallMethod] : 'none yet'}
-              </div>
+              <div className="hint">Floor height: {floorKnown ? 'known' : 'not yet (boxes spawn 1.4 m below eye)'}</div>
+              <div className="hint">Objects: {objects.length}</div>
               <div className="hint">Blend mode: {info.environmentBlendMode}</div>
               <div className="hint">Render rate: {fps ? `${fps} fps` : 'measuring'}</div>
               <div className="hint">Render scale: {info.renderScale}</div>
@@ -202,41 +160,61 @@ export default function ArOverlay({
 
       <footer className="ar-bottom">
         <div className="ar-guide">
-          {paused ? 'AR is paused. Return to this tab to continue.' : guidance(mode, tracking, reticle, wallSetup, hitTest)}
+          {paused ? 'AR is paused. Return to this tab to continue.' : guidance(tracking, objects.length > 0, !!selected)}
         </div>
-        <div className="ar-mode" role="radiogroup" aria-label="Placement mode">
-          <button
-            className={mode === 'floor' ? 'active' : ''}
-            role="radio"
-            aria-checked={mode === 'floor'}
-            onClick={() => onModeChange('floor')}
-          >
-            Floor
-          </button>
-          <button
-            className={mode === 'wall' ? 'active' : ''}
-            role="radio"
-            aria-checked={mode === 'wall'}
-            onClick={() => onModeChange('wall')}
-          >
-            Wall (TV)
-          </button>
-        </div>
-        <div className="ar-actions">
-          {objectCount > 0 && (
-            <button className="ar-secondary" onClick={onClear}>
-              Clear ({objectCount})
-            </button>
-          )}
-          {mode === 'wall' && wallSetup !== 'none' && (
-            <button className="ar-secondary" onClick={onResetWall}>
-              Reset wall
-            </button>
-          )}
-          <button className="ar-place" disabled={!placeable} onClick={onPlace}>
-            {placeLabel(mode, reticle, wallSetup)}
-          </button>
-        </div>
+
+        {selected ? (
+          <section className="ar-pad">
+            <div className="ar-pad-title">
+              <span>
+                {selected.kind === 'tv' ? 'TV' : 'Box'} {selectedIndex} of {objects.length}
+              </span>
+              <button className="ar-chip" onClick={onDeselect}>
+                Done
+              </button>
+            </div>
+            <div className="ar-pad-grid">
+              <button onClick={() => onNudge(-STEP_M, 0, 0)}>◀ Left</button>
+              <button onClick={() => onNudge(0, STEP_M, 0)}>▲ Up</button>
+              <button onClick={() => onNudge(STEP_M, 0, 0)}>Right ▶</button>
+              <button onClick={() => onNudge(0, 0, -STEP_M)}>Closer</button>
+              <button onClick={() => onNudge(0, -STEP_M, 0)}>▼ Down</button>
+              <button onClick={() => onNudge(0, 0, STEP_M)}>Farther</button>
+              <button onClick={() => onRotate(-STEP_DEG)}>⟲ Rotate</button>
+              <button onClick={onFaceUser}>Face me</button>
+              <button onClick={() => onRotate(STEP_DEG)}>Rotate ⟳</button>
+              <button onClick={() => onScale(1 / STEP_SCALE)}>− Size</button>
+              <button onClick={onDuplicate}>Duplicate</button>
+              <button onClick={() => onScale(STEP_SCALE)}>+ Size</button>
+            </div>
+            <div className="ar-pad-row">
+              <button className="ar-danger" onClick={onDelete}>
+                Delete
+              </button>
+              <button disabled={!canUndo} onClick={onUndo}>
+                Undo
+              </button>
+            </div>
+          </section>
+        ) : (
+          <div className="ar-actions">
+            {CATALOGUE.map((m) => (
+              <button key={m.kind} className="ar-place" onClick={() => onSpawn(m.kind)}>
+                + {m.label}
+              </button>
+            ))}
+            {canUndo && (
+              <button className="ar-secondary" onClick={onUndo}>
+                Undo
+              </button>
+            )}
+            {objects.length > 0 && (
+              <button className="ar-secondary" onClick={onClear}>
+                Clear
+              </button>
+            )}
+          </div>
+        )}
       </footer>
     </div>
   );

@@ -392,3 +392,84 @@ ul.steps {
   flex-direction: column;
   gap: 4px;
 }
+
+/* ---------- Gesture layer and object control pad ---------- */
+
+.ar-gesture {
+  position: absolute;
+  inset: 0;
+  pointer-events: auto;
+  touch-action: none;
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+.ar-top,
+.ar-bottom {
+  position: relative;
+  z-index: 1;
+}
+
+.ar-panel,
+.ar-banner {
+  z-index: 1;
+}
+
+.ar-pad {
+  width: 100%;
+  max-width: 420px;
+  background: rgba(11, 15, 25, 0.8);
+  border-radius: var(--radius);
+  padding: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  pointer-events: auto;
+}
+
+.ar-pad-title {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-weight: 600;
+  padding: 0 4px;
+}
+
+.ar-chip {
+  min-height: 36px;
+  padding: 0 14px;
+  background: var(--accent);
+  font-weight: 600;
+  border-radius: 999px;
+}
+
+.ar-pad-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 6px;
+}
+
+.ar-pad-grid button,
+.ar-pad-row button {
+  min-height: 46px;
+  padding: 0 6px;
+  font-size: 0.9rem;
+  font-weight: 600;
+  background: var(--surface-2);
+  border-radius: 12px;
+}
+
+.ar-pad-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px;
+}
+
+.ar-danger {
+  background: rgba(255, 93, 108, 0.25) !important;
+  color: var(--err);
+}
+
+.ar-actions .ar-place {
+  min-height: 52px;
+}

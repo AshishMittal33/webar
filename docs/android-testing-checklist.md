@@ -51,69 +51,36 @@ version and Chrome version with each result so problems can be traced.
       Block). The landing screen shows "Camera access was denied" with the
       instructions to re-enable it.
 
-## Phase 3: hit-testing and floor placement
+## Phase 3 and 4 (historical)
 
-- [ ] Start AR. Point the camera at the floor and move slowly. A green ring
-      (the reticle) appears on the floor within a few seconds.
-- [ ] Move the phone: the ring slides along the floor and stays flat on it.
-- [ ] Point at a wall. The ring should turn amber and the guide text should
-      say "Wall detected". Note whether this happens at all on your device:
+Floor hit-testing was verified on the first test tablet. Automatic wall
+placement was investigated and dropped; see README "Honest limitations".
 
-      Wall reticle appears: yes / no   Device: ______________
+## Phase 5: spawn and adjust objects
 
-- [ ] Point at the floor again and press "Place cube". A blue cube appears
-      sitting on the floor at the ring, not floating or sunk into it.
-- [ ] Tap anywhere on the empty camera view (not on a button). Another cube
-      appears at the ring. Tapping the "i" or "Exit AR" buttons must NOT
-      place a cube.
-- [ ] Place 3 or 4 cubes in different spots. Walk around the room and come
-      back. All cubes are still where you put them.
-- [ ] Open "i". "Anchors" should read "supported (N/N anchored)" with N equal
-      to the number of cubes. If it says 0 anchored, anchors are not working
-      on this device; cubes still work but may drift slightly.
-- [ ] Press "Clear". All cubes disappear and the counter resets.
-- [ ] Exit AR and Start again. The scene is empty (objects do not survive a
-      session; this is expected until save/restore in Phase 6).
+- [ ] Start AR, scan the floor until the status is green.
+- [ ] Tap "+ TV". A TV appears about 1.5 m in front of you at eye height,
+      facing you, with a yellow outline (selected).
+- [ ] Walk around it. It stays fixed in space. Small drift when tracking
+      recovers from Lost is expected; shaking while Tracking is green is not.
+- [ ] Drag the TV with one finger: it slides left/right and up/down.
+- [ ] Pinch with two fingers: it resizes. Twist two fingers: it rotates.
+      Move both fingers up: it moves away. Down: it comes closer.
+- [ ] Use the buttons: Left/Right/Up/Down/Closer/Farther move 5 cm, Rotate
+      turns 10 degrees, Face me turns it toward you, +/- Size resizes.
+- [ ] Push the TV back until it sits on the wall. Walk to the side and check
+      it is flat on the wall. Adjust with Rotate if needed.
+- [ ] Tap "Duplicate" twice: two more TVs appear beside it. Drag them along
+      the wall. Three TVs on the same wall.
+- [ ] Tap "Done", then tap "+ Box". A box appears on the floor (if the
+      floor was scanned) in front of you. Drag it around the floor.
+- [ ] Tap an object to select it, tap empty space to deselect. Tapping the
+      buttons never selects or moves anything by accident.
+- [ ] Delete one TV, then Undo: it comes back. Move it, then Undo: it
+      returns to where it was.
+- [ ] Open "i": Objects count and "Floor height: known".
+- [ ] Clear removes everything.
 
-## Phase 4: wall placement (TV)
-
-Wall detection is not guaranteed on Android, and tracking the camera close
-to a plain wall is unreliable on every device. The main wall method therefore
-only needs the floor: two taps along the line where the wall meets the floor
-define the wall, and TVs snap onto it.
-
-- [ ] Start AR with "Depth wall assist" OFF (the default). Scan the floor
-      until tracking is green, then tap "Wall (TV)".
-- [ ] Stand about 2 m from the wall. Aim the ring at the line where the wall
-      meets the floor and press "Set wall point 1". An amber dot appears.
-- [ ] Move the aim at least half a metre along the same wall base and press
-      "Set wall point 2". A faint blue transparent wall and a base line
-      appear. Check they line up with the real wall. If not, press
-      "Reset wall" and set the two points again.
-- [ ] Aim at the floor below where you want the TV and press "Place TV".
-      The TV appears on the wall 1.2 m up, flat against it.
-- [ ] Place three TVs side by side. Walk to the side: all three are flat on
-      the wall and in a straight line.
-- [ ] Walk toward a TV. Tracking may say Limited when the camera sees only
-      plain wall; the message tells you to step back. TVs must not jump when
-      tracking recovers (small corrections are normal).
-- [ ] Open "i": read "Wall setup", "Last wall placement" and "Anchors".
-- [ ] Optional, textured wall: aim at it for 10 to 20 seconds. If a GREEN
-      ring appears flat on the wall with "Wall detected", automatic wall
-      detection works on this device. Record it:
-
-      Automatic wall detection: yes / no   Device: ______________
-
-- [ ] Optional, depth assist: exit, turn ON "Depth wall assist" on the start
-      screen, start again, aim at the wall. A BLUE ring means depth is
-      active. Check whether tracking stays stable; if it gets worse, leave
-      the option off on this device and note it here:
-
-      Depth assist usable: yes / no
-
-- [ ] Switch back to "Floor" and place a cube on the floor in the same
-      session. TVs and cube all stay in place.
-
-## Phase 5 and later
+## Phase 6 and later
 
 Added when those phases are implemented.
