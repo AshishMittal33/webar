@@ -9,6 +9,8 @@ export interface SessionInfo {
   environmentBlendMode: string;
   referenceSpace: string;
   domOverlaySupported: boolean;
+  /** WebXR framebuffer scale actually used (1 = native, 0.5 = quarter pixels). */
+  renderScale: number;
 }
 
 export interface ArError {

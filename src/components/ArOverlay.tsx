@@ -83,6 +83,7 @@ export default function ArOverlay({
               <div className="hint">Blend mode: {info.environmentBlendMode}</div>
               <div className="hint">Reference space: {info.referenceSpace}</div>
               <div className="hint">Render rate: {fps ? `${fps} fps` : 'measuring'}</div>
+              <div className="hint">Render scale: {info.renderScale}</div>
               <div className="hint">Screen: {window.innerWidth}x{window.innerHeight} @ {window.devicePixelRatio}x</div>
             </>
           ) : (

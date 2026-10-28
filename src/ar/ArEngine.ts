@@ -14,6 +14,21 @@ import {
  */
 const OPTIONAL_FEATURES = ['dom-overlay', 'hit-test', 'anchors', 'light-estimation'];
 
+/** Pixel budget per AR frame, roughly 1080p. Above this we scale down. */
+const TARGET_PIXELS = 2_000_000;
+
+/**
+ * Chooses the WebXR framebuffer scale for this screen: 1.0 on phones with
+ * modest resolution, down to 0.5 on large high-DPI tablets.
+ */
+export function computeRenderScale(): number {
+  const dpr = window.devicePixelRatio || 1;
+  const physical = window.innerWidth * dpr * window.innerHeight * dpr;
+  if (!physical) return 1;
+  const scale = Math.sqrt(TARGET_PIXELS / physical);
+  return Math.min(1, Math.max(0.5, Math.round(scale * 100) / 100));
+}
+
 /**
  * Owns the WebXR session, the Three.js renderer and the render loop.
  *
@@ -100,12 +115,16 @@ export class ArEngine {
     session.addEventListener('visibilitychange', this.onVisibilityChange);
 
     renderer.xr.setReferenceSpaceType('local');
+    // Render the AR layer at a lower internal resolution on large or very
+    // high-DPI screens. Big tablets otherwise push 5+ megapixels per frame.
+    const renderScale = computeRenderScale();
+    renderer.xr.setFramebufferScaleFactor(renderScale);
     await renderer.xr.setSession(session);
 
     this.addTestCube();
     renderer.setAnimationLoop(this.onFrame);
 
-    this.emit({ type: 'started', info: this.collectSessionInfo(session) });
+    this.emit({ type: 'started', info: this.collectSessionInfo(session, renderScale) });
   }
 
   /** Ends the session. Resolves after cleanup; safe to call twice. */
@@ -121,11 +140,14 @@ export class ArEngine {
 
   private createRenderer(host: HTMLElement): THREE.WebGLRenderer {
     const renderer = new THREE.WebGLRenderer({
-      antialias: true,
+      // MSAA is expensive on mobile GPUs; edges are acceptable without it.
+      antialias: false,
       alpha: true,
+      stencil: false,
+      preserveDrawingBuffer: false,
       powerPreference: 'high-performance',
     });
-    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.setPixelRatio(1);
     renderer.setSize(host.clientWidth || window.innerWidth, host.clientHeight || window.innerHeight);
     renderer.xr.enabled = true;
     // No shadow maps: mid-range phones and real-time shadows do not mix.
@@ -134,7 +156,7 @@ export class ArEngine {
     return renderer;
   }
 
-  private collectSessionInfo(session: XRSession): SessionInfo {
+  private collectSessionInfo(session: XRSession, renderScale: number): SessionInfo {
     const withFeatures = session as XRSession & { enabledFeatures?: string[] };
     const enabled = withFeatures.enabledFeatures ?? ['(enabledFeatures not reported by this browser)'];
     const missing = OPTIONAL_FEATURES.filter((f) => !enabled.includes(f));
@@ -144,6 +166,7 @@ export class ArEngine {
       environmentBlendMode: session.environmentBlendMode,
       referenceSpace: 'local',
       domOverlaySupported: enabled.includes('dom-overlay'),
+      renderScale,
     };
   }
 
