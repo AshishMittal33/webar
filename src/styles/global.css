@@ -1,0 +1,158 @@
+:root {
+  --bg: #0b0f19;
+  --surface: #151b2b;
+  --surface-2: #1e2638;
+  --text: #f1f4fa;
+  --muted: #9aa5bd;
+  --accent: #4f8cff;
+  --accent-strong: #2f6fe6;
+  --ok: #37c978;
+  --warn: #f5b942;
+  --err: #ff5d6c;
+  --radius: 16px;
+  color-scheme: dark;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  margin: 0;
+  height: 100%;
+  background: var(--bg);
+  color: var(--text);
+  font-family: system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+  -webkit-tap-highlight-color: transparent;
+  overscroll-behavior: none;
+}
+
+button {
+  font: inherit;
+  cursor: pointer;
+  border: none;
+  border-radius: var(--radius);
+  min-height: 52px;
+  padding: 0 20px;
+  color: var(--text);
+  background: var(--surface-2);
+  touch-action: manipulation;
+}
+
+button:active {
+  transform: scale(0.98);
+}
+
+button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.btn-primary {
+  background: var(--accent);
+  font-weight: 600;
+  font-size: 1.05rem;
+  width: 100%;
+}
+
+.btn-primary:active {
+  background: var(--accent-strong);
+}
+
+.btn-ghost {
+  background: transparent;
+  color: var(--muted);
+  text-decoration: underline;
+  min-height: 44px;
+  padding: 0;
+  align-self: flex-start;
+}
+
+.landing {
+  min-height: 100%;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  padding: 24px 20px;
+  padding-bottom: max(24px, env(safe-area-inset-bottom));
+  max-width: 480px;
+  margin: 0 auto;
+  gap: 20px;
+}
+
+.landing h1 {
+  font-size: 1.9rem;
+  line-height: 1.15;
+  margin: 0;
+}
+
+.landing p {
+  color: var(--muted);
+  margin: 0;
+  line-height: 1.5;
+}
+
+.card {
+  background: var(--surface);
+  border-radius: var(--radius);
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.status-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  font-size: 0.95rem;
+}
+
+.badge {
+  padding: 4px 10px;
+  border-radius: 999px;
+  font-size: 0.8rem;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.badge.ok {
+  background: rgba(55, 201, 120, 0.2);
+  color: var(--ok);
+}
+
+.badge.warn {
+  background: rgba(245, 185, 66, 0.2);
+  color: var(--warn);
+}
+
+.badge.err {
+  background: rgba(255, 93, 108, 0.2);
+  color: var(--err);
+}
+
+.badge.pending {
+  background: var(--surface-2);
+  color: var(--muted);
+}
+
+.hint {
+  font-size: 0.85rem;
+  color: var(--muted);
+}
+
+.check-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+ul.steps {
+  margin: 0;
+  padding-left: 20px;
+  color: var(--muted);
+  line-height: 1.6;
+}
