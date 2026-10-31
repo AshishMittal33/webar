@@ -780,6 +780,15 @@ export class ArEngine {
     this.scanning = false;
     this.scanReticle.visible = false;
     this.scanEmitted = 1;
+    // Surface detection is only needed for the scan and the floor height.
+    // Stopping it leaves ARCore more processing time for tracking, which is
+    // what device logs show failing (repeated 3 to 13 s tracking drops).
+    if (this.hitTestSource) {
+      this.hitTestSource.cancel();
+      this.hitTestSource = null;
+      this.centreHit = null;
+      this.log(`surface detection stopped after scan (floor ${this.floorY === null ? 'not found' : 'found'})`);
+    }
     const sweep = Math.round(THREE.MathUtils.radToDeg(this.scanYawMax - this.scanYawMin));
     this.log(
       `room scan ${skipped ? 'SKIPPED' : 'complete'}: ${(this.scanTrackedMs / 1000).toFixed(1)} s tracked, ` +

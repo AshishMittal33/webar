@@ -326,7 +326,10 @@ export default function ArOverlay({
         <section className="center-card" role="status">
           <AlertIcon width={30} height={30} />
           <strong>Tracking paused</strong>
-          <span>Point at the floor or at something with detail and move slowly. Your items come back in place.</span>
+          <span>
+            Hold still, then slowly point the tablet back at the area you scanned, from where you were standing. Your
+            items come back in their exact place when the tablet recognises it.
+          </span>
         </section>
       )}
 
@@ -341,8 +344,8 @@ export default function ArOverlay({
               <section className="lost-bar">
                 <span>
                   {lostCount === 1
-                    ? '1 item lost its place when tracking dropped. It returns by itself if the room is recognised again.'
-                    : `${lostCount} items lost their place when tracking dropped. They return by themselves if the room is recognised again.`}
+                    ? '1 item is waiting to find its place. Slowly point at the area where you put it and hold still. If it does not return, bring it back here.'
+                    : `${lostCount} items are waiting to find their place. Slowly point at the area where you put them and hold still. If they do not return, bring them back here.`}
                 </span>
                 <button className="pill-btn light" disabled={!canPlace} onClick={onRecoverLost}>
                   <RestoreIcon width={18} height={18} />
