@@ -79,7 +79,7 @@ const TRACKING_LABEL: Record<TrackingState, string> = {
 
 const HINT_TEXT: Record<TrackingHint, string> = {
   'too-close': 'Very close to the surface. Step back a little to keep tracking.',
-  'too-fast': 'Moving fast. Turn the tablet more slowly.',
+  'too-fast': 'Moving too fast. The room map drifts and items can jump. Move the tablet slowly.',
 };
 
 const KIND_ICON: Record<ObjectKind, ReactNode> = {
@@ -120,7 +120,17 @@ function Tool({
   );
 }
 
-function ScanPanel({ progress, tracking, onSkip }: { progress: number; tracking: TrackingState; onSkip: () => void }) {
+function ScanPanel({
+  progress,
+  tracking,
+  floorKnown,
+  onSkip,
+}: {
+  progress: number;
+  tracking: TrackingState;
+  floorKnown: boolean;
+  onSkip: () => void;
+}) {
   const pct = Math.round(progress * 100);
   const r = 34;
   const circumference = 2 * Math.PI * r;
@@ -145,7 +155,9 @@ function ScanPanel({ progress, tracking, onSkip }: { progress: number; tracking:
       <div className="scan-text">
         <strong>{tracking === 'tracking' ? `Scanning room ${pct}%` : 'Getting ready'}</strong>
         <span>
-          Move the tablet slowly from side to side. Point at the floor, then at the wall where the TV will go.
+          {floorKnown
+            ? 'Floor found. Now slowly sweep across the wall where the TV will go.'
+            : 'Point the tablet down at the floor and move it slowly from side to side.'}
         </span>
       </div>
       <button className="link-btn" onClick={onSkip}>
@@ -336,7 +348,7 @@ export default function ArOverlay({
       <footer className="ar-bottom">
         {paused && <div className="guide">AR is paused. Return to this tab to continue.</div>}
 
-        {!paused && scanning && <ScanPanel progress={scanProgress} tracking={tracking} onSkip={onSkipScan} />}
+        {!paused && scanning && <ScanPanel progress={scanProgress} tracking={tracking} floorKnown={floorKnown} onSkip={onSkipScan} />}
 
         {!paused && !scanning && (
           <>

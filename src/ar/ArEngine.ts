@@ -61,7 +61,10 @@ const SCAN_SWEEP_RAD = THREE.MathUtils.degToRad(60);
 /** Hints: closer than this to the surface at the screen centre... */
 const HINT_CLOSE_M = 0.6;
 /** ...or turning faster than this (rad/s), ARCore tends to lose tracking. */
-const HINT_FAST_RAD_S = 2.2;
+const HINT_FAST_RAD_S = 1.5;
+
+/** A horizontal surface must be at least this far below the tablet to count as the floor. */
+const FLOOR_MIN_BELOW_CAMERA = 0.9;
 
 /** Debug log: anchor corrections and frame stalls above these are recorded. */
 const LOG_JUMP_M = 0.05;
@@ -252,8 +255,14 @@ export class ArEngine {
   private refSpace: XRReferenceSpace | null = null;
 
   /** Surface under the screen centre this frame, from the hit test. */
-  private centreHit: { position: THREE.Vector3; matrix: THREE.Matrix4; distance: number; horizontal: boolean } | null =
-    null;
+  private centreHit: {
+    position: THREE.Vector3;
+    matrix: THREE.Matrix4;
+    distance: number;
+    horizontal: boolean;
+    /** How far the surface is below the camera, in metres. */
+    belowCamera: number;
+  } | null = null;
 
   // Room scan
   private scanning = true;
@@ -720,13 +729,19 @@ export class ArEngine {
       matrix: new THREE.Matrix4().fromArray(pose.transform.matrix),
       distance: position.distanceTo(new THREE.Vector3(v.x, v.y, v.z)),
       horizontal: normal.y > 0.75,
+      belowCamera: v.y - p.y,
     };
   }
 
-  /** Keeps the lowest horizontal hit seen so floor objects spawn on the floor. */
+  /**
+   * Keeps the lowest horizontal hit seen so floor objects spawn on the floor.
+   * Surfaces less than FLOOR_MIN_BELOW_CAMERA under the tablet are desks,
+   * beds or tables, not the floor (a device log showed a table spawning
+   * 25 cm above the floor because only a raised surface had been seen).
+   */
   private learnFloor() {
     const hit = this.centreHit;
-    if (!hit || !hit.horizontal) return;
+    if (!hit || !hit.horizontal || hit.belowCamera < FLOOR_MIN_BELOW_CAMERA) return;
     const wasKnown = this.floorY !== null;
     this.floorY = wasKnown ? Math.min(this.floorY!, hit.position.y) : hit.position.y;
     if (!wasKnown) this.emit({ type: 'floor', known: true });
@@ -759,11 +774,13 @@ export class ArEngine {
     }
     this.scanLastYaw = yaw;
 
-    const progress =
+    let progress =
       (Math.min(1, this.scanTrackedMs / SCAN_TIME_MS) +
         Math.min(1, this.scanCells.size / SCAN_CELLS) +
         Math.min(1, (this.scanYawMax - this.scanYawMin) / SCAN_SWEEP_RAD)) /
       3;
+    // The scan only completes once the real floor has been seen.
+    if (this.floorY === null) progress = Math.min(progress, 0.9);
     if (progress >= 0.999) this.finishScan(false);
     else if (progress - this.scanEmitted >= 0.02) {
       this.scanEmitted = progress;
