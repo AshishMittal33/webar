@@ -1,14 +1,17 @@
 import { useEffect, useState } from 'react';
 import { checkWebXrSupport, type SupportReport } from '../ar/support';
 import type { ArError } from '../ar/types';
+import DebugLogButton from './DebugLogButton';
 
 interface LandingProps {
   onStart: () => void;
   /** Message from a previous attempt (permission denied, session ended...). */
   notice?: ArError | null;
+  /** Present after an AR session, so its log can be copied after exiting. */
+  getDebugLog?: () => string;
 }
 
-export default function Landing({ onStart, notice }: LandingProps) {
+export default function Landing({ onStart, notice, getDebugLog }: LandingProps) {
   const [report, setReport] = useState<SupportReport | null>(null);
   const [showDiag, setShowDiag] = useState(false);
 
@@ -90,6 +93,14 @@ export default function Landing({ onStart, notice }: LandingProps) {
           Supported: ARCore-certified Android devices running a recent Google Chrome, opened over
           HTTPS.
         </p>
+      )}
+
+      {getDebugLog && (
+        <section className="card">
+          <strong>Report a problem</strong>
+          <p className="hint">Copies what happened during the last AR session, so it can be sent for fixing.</p>
+          <DebugLogButton getLog={getDebugLog} label="Copy debug log of last AR session" />
+        </section>
       )}
     </main>
   );

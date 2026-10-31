@@ -121,7 +121,7 @@ export default function App() {
   // so the control pad can be looked at on a desktop.
   const previewSpawn = (kind: ObjectKind) => {
     const id = String(objects.length + 1);
-    setObjects((o) => [...o, { id, kind }]);
+    setObjects((o) => [...o, { id, kind, lost: false }]);
     setSelectedId(id);
     setCanUndo(true);
   };
@@ -177,7 +177,13 @@ export default function App() {
 
   return (
     <>
-      {screen === 'landing' && <Landing onStart={handleStart} notice={notice} />}
+      {screen === 'landing' && (
+        <Landing
+          onStart={handleStart}
+          notice={notice}
+          getDebugLog={engine.hasDebugLog ? () => engine.getDebugLog() : undefined}
+        />
+      )}
 
       {/* Always mounted so the engine can attach a canvas and the overlay root
           exists before requestSession is called. */}
@@ -208,6 +214,8 @@ export default function App() {
             onDeselect={handleDeselect}
             onUndo={handleUndo}
             onClear={handleClear}
+            onRecoverLost={() => engine.recoverLost()}
+            getDebugLog={() => engine.getDebugLog()}
             onGesture={handleGesture}
             onExit={handleExit}
             onStatsToggle={handleStatsToggle}

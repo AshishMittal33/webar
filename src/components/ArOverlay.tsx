@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react';
 import type { GestureEvent } from '../ar/ArEngine';
 import { CATALOGUE } from '../ar/models';
+import DebugLogButton from './DebugLogButton';
 import type { ObjectKind, ObjectSummary, SessionInfo, TrackingState } from '../ar/types';
 
 interface ArOverlayProps {
@@ -26,6 +27,9 @@ interface ArOverlayProps {
   onDeselect: () => void;
   onUndo: () => void;
   onClear: () => void;
+  /** Put objects whose anchor was lost back in front of the user. */
+  onRecoverLost: () => void;
+  getDebugLog: () => string;
   onGesture: (e: GestureEvent) => void;
   onExit: () => void;
   /** Called when the details panel opens or closes (fps stats cost redraws). */
@@ -90,6 +94,8 @@ export default function ArOverlay({
   onDeselect,
   onUndo,
   onClear,
+  onRecoverLost,
+  getDebugLog,
   onGesture,
   onExit,
   onStatsToggle,
@@ -113,6 +119,7 @@ export default function ArOverlay({
   const paused = visibility !== 'visible';
   const selected = objects.find((o) => o.id === selectedId) ?? null;
   const selectedIndex = selected ? objects.indexOf(selected) + 1 : 0;
+  const lostCount = objects.filter((o) => o.lost).length;
 
   // Touches from the hands holding the device: thumbs resting near the left
   // and right edges, or a palm (large contact area). These are dropped so
@@ -185,10 +192,23 @@ export default function ArOverlay({
           ) : (
             <div className="hint">Waiting for session to start.</div>
           )}
+          <DebugLogButton getLog={getDebugLog} />
         </section>
       )}
 
       <footer className="ar-bottom">
+        {lostCount > 0 && !paused && (
+          <section className="ar-lost">
+            <span>
+              {lostCount === 1
+                ? '1 object lost its place when tracking dropped. It comes back by itself if the tablet recognises the room again.'
+                : `${lostCount} objects lost their place when tracking dropped. They come back by themselves if the tablet recognises the room again.`}
+            </span>
+            <button className="ar-chip" disabled={tracking !== 'tracking'} onClick={onRecoverLost}>
+              Bring back here
+            </button>
+          </section>
+        )}
         <div className="ar-guide">
           {paused
             ? 'AR is paused. Return to this tab to continue.'

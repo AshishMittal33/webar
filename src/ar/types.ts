@@ -7,6 +7,8 @@ export type ObjectKind = 'tv' | 'cube';
 export interface ObjectSummary {
   id: string;
   kind: ObjectKind;
+  /** ARCore lost this object's anchor; the UI offers to bring it back. */
+  lost: boolean;
 }
 
 /** Facts about the running session, reported once it has started. */

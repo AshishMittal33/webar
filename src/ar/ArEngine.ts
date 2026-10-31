@@ -35,8 +35,19 @@ const MAX_DISTANCE = 12;
 
 /** If an edit moves an object this far from its anchor, give it a new one nearby. */
 const REANCHOR_DISTANCE = 0.5;
-/** Frames an anchor may stay untracked (while the camera tracks) before it is replaced. */
-const ANCHOR_UNTRACKED_LIMIT = 120;
+/**
+ * An object whose anchor stays untracked this long (while the camera itself
+ * tracks) is reported to the user as lost. The anchor is never thrown away
+ * automatically: ARCore may still recognise the room and restore it.
+ */
+const LOST_AFTER_MS = 3000;
+/** Wait before retrying a failed anchor creation. */
+const ANCHOR_RETRY_MS = 1000;
+
+/** Debug log: anchor corrections and frame stalls above these are recorded. */
+const LOG_JUMP_M = 0.05;
+const LOG_LONG_FRAME_MS = 120;
+const DEBUG_LOG_LIMIT = 400;
 
 /** One-finger movement below this (normalized screen units) is a tap. */
 const TAP_SLOP = 0.01;
@@ -63,6 +74,11 @@ export function computeRenderScale(): number {
   if (!physical) return 1;
   const scale = Math.sqrt(TARGET_PIXELS / physical);
   return Math.min(1, Math.max(0.5, Math.round(scale * 100) / 100));
+}
+
+/** "(x, y, z)" in metres with centimetre precision, for the debug log. */
+function fmt(v: THREE.Vector3): string {
+  return `(${v.x.toFixed(2)}, ${v.y.toFixed(2)}, ${v.z.toFixed(2)})`;
 }
 
 /** Rotation for an upright object whose front (+Z) points along `dir`. */
@@ -107,7 +123,12 @@ interface SceneObject {
   /** Create an anchor at the object's current pose on the next frame. */
   needsAnchor: boolean;
   anchorPending: boolean;
-  untrackedFrames: number;
+  /** performance.now() before which a failed anchor is not retried. */
+  anchorRetryAt: number;
+  /** performance.now() when the anchor stopped being tracked, or 0. */
+  untrackedSince: number;
+  /** Anchor untracked for LOST_AFTER_MS; the UI offers to bring it back. */
+  lost: boolean;
 }
 
 type AnchorCapableFrame = XRFrame & {
@@ -200,6 +221,14 @@ export class ArEngine {
   // Scratch objects reused every frame to avoid garbage.
   private readonly tmpMatrix = new THREE.Matrix4();
   private readonly tmpScale = new THREE.Vector3();
+  private readonly tmpPos = new THREE.Vector3();
+
+  // Debug recorder: a short event history the user can copy and send.
+  private debugLines: string[] = [];
+  private debugHeader: string[] = [];
+  private sessionStartMs = 0;
+  private lastFrameMs = 0;
+  private noPoseSince = 0;
 
   constructor() {
     const hemi = new THREE.HemisphereLight(0xffffff, 0x667799, 1.0);
@@ -246,6 +275,12 @@ export class ArEngine {
     this.frameCount = 0;
     this.fpsWindowStart = 0;
     this.hasPose = false;
+    this.sessionStartMs = performance.now();
+    this.lastFrameMs = 0;
+    this.noPoseSince = 0;
+    this.debugLines = [];
+    this.debugHeader = [];
+    this.log('AR session requested');
 
     let session: XRSession;
     try {
@@ -270,6 +305,13 @@ export class ArEngine {
     const info = this.collectSessionInfo(session, renderScale);
     this.anchorsAvailable = info.anchorsSupported;
     await this.setupHitTest(session, info);
+    this.debugHeader = [
+      `browser: ${navigator.userAgent}`,
+      `screen: ${window.innerWidth}x${window.innerHeight} @ ${window.devicePixelRatio}x, render scale ${renderScale}`,
+      `features: ${info.enabledFeatures.join(', ')}`,
+      `hit-test: ${info.hitTestSupported ? 'yes' : 'no'}, anchors: ${info.anchorsSupported ? 'yes' : 'no'}`,
+    ];
+    this.log('AR session started');
 
     renderer.setAnimationLoop(this.onFrame);
     this.emit({ type: 'started', info });
@@ -341,11 +383,29 @@ export class ArEngine {
     const renderer = this.renderer;
     if (!renderer) return;
 
+    const now = performance.now();
+    if (this.lastFrameMs && now - this.lastFrameMs > LOG_LONG_FRAME_MS) {
+      this.log(`slow frame: ${Math.round(now - this.lastFrameMs)} ms`);
+    }
+    this.lastFrameMs = now;
+
     if (frame) {
       const refSpace = renderer.xr.getReferenceSpace();
       const viewerPose = (refSpace ? frame.getViewerPose(refSpace) : null) ?? null;
       this.updateTracking(viewerPose);
+      const hadPose = this.hasPose;
       this.hasPose = viewerPose !== null;
+      if (hadPose && !this.hasPose) {
+        this.noPoseSince = now;
+        this.log('camera tracking LOST (no camera pose), objects hidden');
+      } else if (!hadPose && this.hasPose) {
+        this.log(
+          this.noPoseSince
+            ? `camera tracking back after ${((now - this.noPoseSince) / 1000).toFixed(1)} s`
+            : 'first camera pose',
+        );
+        this.noPoseSince = 0;
+      }
       // Like the WebXR samples: with no viewer pose there is nothing correct
       // to draw. Three.js would otherwise reuse the last camera and the
       // objects would look glued to the screen.
@@ -366,8 +426,15 @@ export class ArEngine {
     if (!this.anchorsAvailable) return;
     const f = frame as AnchorCapableFrame;
 
+    const now = performance.now();
     for (const obj of this.objects) {
-      if (obj.needsAnchor && !obj.anchorPending && typeof f.createAnchor === 'function') {
+      if (
+        obj.needsAnchor &&
+        !obj.anchorPending &&
+        now >= obj.anchorRetryAt &&
+        this.trackingState === 'tracking' &&
+        typeof f.createAnchor === 'function'
+      ) {
         this.createAnchorFor(obj, f, refSpace);
       }
 
@@ -379,20 +446,32 @@ export class ArEngine {
       const pose = frame.getPose(obj.anchor.anchorSpace, refSpace);
       if (!pose) {
         // The anchor is not tracked right now. Hide the object rather than
-        // draw it somewhere that may be wrong, as the samples do. If this
-        // lasts while the camera itself tracks, replace the anchor.
+        // draw it somewhere that may be wrong, and never replace the anchor:
+        // when ARCore recognises the room again it restores the anchor and
+        // the object reappears exactly where it was. Replacing it pinned the
+        // object to stale coordinates, which is how objects ended up back in
+        // the middle of the view. After a while the user is told and can
+        // choose to bring it back.
         obj.root.visible = false;
-        obj.untrackedFrames += 1;
-        if (obj.untrackedFrames > ANCHOR_UNTRACKED_LIMIT) {
-          obj.anchor.delete();
-          obj.anchor = null;
-          obj.needsAnchor = true;
-          obj.root.visible = true;
+        if (!obj.untrackedSince) {
+          obj.untrackedSince = now;
+          this.log(`${this.label(obj)}: anchor not tracked, hidden`);
+        } else if (!obj.lost && now - obj.untrackedSince > LOST_AFTER_MS) {
+          obj.lost = true;
+          this.log(`${this.label(obj)}: LOST, anchor untracked for ${LOST_AFTER_MS / 1000} s`);
+          this.emitObjects();
         }
         continue;
       }
 
-      obj.untrackedFrames = 0;
+      if (obj.untrackedSince) {
+        this.log(`${this.label(obj)}: anchor tracked again after ${((now - obj.untrackedSince) / 1000).toFixed(1)} s`);
+        obj.untrackedSince = 0;
+        if (obj.lost) {
+          obj.lost = false;
+          this.emitObjects();
+        }
+      }
       obj.root.visible = true;
       obj.anchorMatrix.fromArray(pose.transform.matrix);
       if (!obj.offsetValid) {
@@ -402,8 +481,13 @@ export class ArEngine {
       if (this.isBeingManipulated(obj.id)) continue;
 
       // Exactly anchorPose * offset, every frame, no filtering.
+      this.tmpPos.copy(obj.root.position);
       this.tmpMatrix.multiplyMatrices(obj.anchorMatrix, obj.offset);
       this.tmpMatrix.decompose(obj.root.position, obj.root.quaternion, this.tmpScale);
+      const jump = this.tmpPos.distanceTo(obj.root.position);
+      if (jump > LOG_JUMP_M) {
+        this.log(`${this.label(obj)}: moved ${Math.round(jump * 100)} cm by an ARCore anchor update`);
+      }
     }
   }
 
@@ -412,6 +496,14 @@ export class ArEngine {
     obj.anchorPending = true;
     const p = obj.root.position;
     const q = obj.root.quaternion;
+    const fail = (reason: unknown) => {
+      obj.anchorPending = false;
+      if (!this.objects.includes(obj)) return;
+      obj.needsAnchor = true;
+      obj.anchorRetryAt = performance.now() + ANCHOR_RETRY_MS;
+      this.log(`${this.label(obj)}: anchor creation FAILED (${String(reason)}), retrying`);
+    };
+    this.log(`${this.label(obj)}: creating anchor at ${fmt(p)}`);
     try {
       frame
         .createAnchor!(new XRRigidTransform({ x: p.x, y: p.y, z: p.z, w: 1 }, { x: q.x, y: q.y, z: q.z, w: q.w }), refSpace)
@@ -423,17 +515,51 @@ export class ArEngine {
           }
           obj.anchor?.delete();
           obj.anchor = anchor;
-          obj.untrackedFrames = 0;
+          obj.untrackedSince = 0;
+          obj.lost = false;
           // The offset is computed from the object's pose when the anchor's
           // first pose arrives, so edits made meanwhile are kept.
           obj.offsetValid = false;
+          this.log(`${this.label(obj)}: anchor created`);
         })
-        .catch(() => {
-          obj.anchorPending = false;
-        });
-    } catch {
-      obj.anchorPending = false;
+        .catch(fail);
+    } catch (err) {
+      fail(err);
     }
+  }
+
+  private label(obj: SceneObject): string {
+    return `${obj.kind === 'tv' ? 'TV' : 'Box'} ${obj.id}`;
+  }
+
+  private log(message: string) {
+    const t = ((performance.now() - this.sessionStartMs) / 1000).toFixed(2).padStart(7);
+    this.debugLines.push(`${t}s  ${message}`);
+    if (this.debugLines.length > DEBUG_LOG_LIMIT) this.debugLines.shift();
+  }
+
+  /** True once there is something worth copying from an AR session. */
+  get hasDebugLog(): boolean {
+    return this.debugLines.length > 0;
+  }
+
+  /** Plain-text report of the last AR session, for the user to copy and send. */
+  getDebugLog(): string {
+    const objects = this.objects.map(
+      (o) =>
+        `${this.label(o)}: at ${fmt(o.root.position)}, anchor ${
+          o.anchor ? 'yes' : o.anchorPending ? 'pending' : 'none'
+        }${o.lost ? ', LOST' : ''}, ${o.root.visible ? 'visible' : 'hidden'}`,
+    );
+    return [
+      'WebAR debug log',
+      `copied: ${new Date().toISOString()}`,
+      ...this.debugHeader,
+      `tracking now: ${this.trackingState}, camera pose: ${this.hasPose ? 'yes' : 'no'}`,
+      ...(objects.length ? objects : ['no objects']),
+      '--- events (seconds since start) ---',
+      ...this.debugLines,
+    ].join('\n');
   }
 
   /** offset = anchorPose^-1 * objectPose (rigid; scale is kept on the root). */
@@ -459,7 +585,10 @@ export class ArEngine {
     }
     this.recomputeOffset(obj);
     const offsetDistance = new THREE.Vector3().setFromMatrixPosition(obj.offset).length();
-    if (offsetDistance > REANCHOR_DISTANCE) obj.needsAnchor = true;
+    if (offsetDistance > REANCHOR_DISTANCE) {
+      obj.needsAnchor = true;
+      this.log(`${this.label(obj)}: moved ${offsetDistance.toFixed(2)} m from its anchor, new anchor requested`);
+    }
   }
 
   /** Keeps the lowest horizontal hit seen so floor objects spawn on the floor. */
@@ -517,6 +646,7 @@ export class ArEngine {
     }
 
     if (next !== this.trackingState) {
+      this.log(`tracking status: ${this.trackingState} -> ${next}`);
       this.trackingState = next;
       this.emit({ type: 'tracking', state: next });
     }
@@ -568,6 +698,7 @@ export class ArEngine {
     const quaternion = quatFacing(cam.forward.clone().negate());
 
     const obj = this.createObject(kind, { position, quaternion, scale: 1 });
+    this.log(`${this.label(obj)}: added at ${fmt(position)}, camera at ${fmt(cam.position)}`);
     this.pushUndo({ type: 'add', id: obj.id });
     this.selectedId = obj.id;
     this.updateOutlines();
@@ -613,7 +744,9 @@ export class ArEngine {
       offsetValid: false,
       needsAnchor: true,
       anchorPending: false,
-      untrackedFrames: 0,
+      anchorRetryAt: 0,
+      untrackedSince: 0,
+      lost: false,
     };
     root.userData.objectId = obj.id;
     this.objects.push(obj);
@@ -632,7 +765,11 @@ export class ArEngine {
   select(id: string | null): void {
     if (id !== null && !this.findObject(id)) return;
     if (id === this.selectedId) return;
+    const previous = this.findObject(this.selectedId);
     this.selectedId = id;
+    const next = this.findObject(id);
+    if (next) this.log(`${this.label(next)}: selected`);
+    else if (previous) this.log(`${this.label(previous)}: Done (deselected) at ${fmt(previous.root.position)}`);
     this.updateOutlines();
     this.emitObjects();
   }
@@ -672,6 +809,7 @@ export class ArEngine {
     this.pushUndo({ type: 'transform', id: obj.id, before: this.snapshot(obj) });
     obj.root.position.addScaledVector(cam.right, dx).addScaledVector(UP, dy).addScaledVector(cam.forward, dz);
     this.clampPosition(obj);
+    this.log(`${this.label(obj)}: button move to ${fmt(obj.root.position)}`);
     this.touch(obj);
   }
 
@@ -681,6 +819,7 @@ export class ArEngine {
     if (!obj) return;
     this.pushUndo({ type: 'transform', id: obj.id, before: this.snapshot(obj) });
     obj.root.rotateOnWorldAxis(UP, THREE.MathUtils.degToRad(degrees));
+    this.log(`${this.label(obj)}: rotated ${degrees} deg`);
     this.touch(obj);
   }
 
@@ -692,6 +831,7 @@ export class ArEngine {
     this.pushUndo({ type: 'transform', id: obj.id, before: this.snapshot(obj) });
     const toCam = cam.position.clone().sub(obj.root.position);
     obj.root.quaternion.copy(quatFacing(toCam));
+    this.log(`${this.label(obj)}: face me`);
     this.touch(obj);
   }
 
@@ -714,6 +854,7 @@ export class ArEngine {
     const t = this.snapshot(obj);
     t.position.addScaledVector(cam.right, width + 0.1);
     const copy = this.createObject(obj.kind, t);
+    this.log(`${this.label(copy)}: duplicated from ${this.label(obj)} at ${fmt(t.position)}`);
     this.pushUndo({ type: 'add', id: copy.id });
     this.selectedId = copy.id;
     this.updateOutlines();
@@ -724,16 +865,51 @@ export class ArEngine {
     const obj = this.selected;
     if (!obj) return;
     this.pushUndo({ type: 'delete', id: obj.id, kind: obj.kind, before: this.snapshot(obj) });
+    this.log(`${this.label(obj)}: deleted`);
     this.removeObject(obj);
     this.selectedId = null;
     this.emitObjects();
   }
 
   clearAll(): void {
+    this.log(`clear all (${this.objects.length} objects)`);
     for (const obj of [...this.objects]) this.removeObject(obj);
     this.selectedId = null;
     this.undoStack = [];
     this.gesture = null;
+    this.emitObjects();
+  }
+
+  /**
+   * Objects whose anchor ARCore could not find again are placed in front of
+   * the user with new anchors. Only on the user's request: while the old
+   * anchor exists ARCore may still restore it to the exact spot.
+   */
+  recoverLost(): void {
+    const cam = this.cameraFrame();
+    if (!cam || !this.canEdit) return;
+    const lost = this.objects.filter((o) => o.lost);
+    if (lost.length === 0) return;
+    const facing = quatFacing(cam.forward.clone().negate());
+    lost.forEach((obj, i) => {
+      const side = (i - (lost.length - 1) / 2) * 1.1;
+      const position = cam.position.clone().addScaledVector(cam.forward, SPAWN_DISTANCE).addScaledVector(cam.right, side);
+      position.y =
+        obj.spawn === 'floor'
+          ? (this.floorY ?? cam.position.y - FLOOR_BELOW_EYE_FALLBACK)
+          : cam.position.y - TV_SPAWN_BELOW_EYE;
+      obj.root.position.copy(position);
+      obj.root.quaternion.copy(facing);
+      obj.anchor?.delete();
+      obj.anchor = null;
+      obj.offsetValid = false;
+      obj.needsAnchor = true;
+      obj.anchorRetryAt = 0;
+      obj.untrackedSince = 0;
+      obj.lost = false;
+      obj.root.visible = true;
+      this.log(`${this.label(obj)}: brought back in front of the user at ${fmt(position)}`);
+    });
     this.emitObjects();
   }
 
@@ -762,7 +938,10 @@ export class ArEngine {
     switch (entry.type) {
       case 'transform': {
         const obj = this.findObject(entry.id);
-        if (obj) this.applyTransform(obj, entry.before);
+        if (obj) {
+          this.applyTransform(obj, entry.before);
+          this.log(`${this.label(obj)}: undo, back to ${fmt(obj.root.position)}`);
+        }
         break;
       }
       case 'add': {
@@ -785,7 +964,7 @@ export class ArEngine {
   }
 
   private emitObjects() {
-    const objects: ObjectSummary[] = this.objects.map((o) => ({ id: o.id, kind: o.kind }));
+    const objects: ObjectSummary[] = this.objects.map((o) => ({ id: o.id, kind: o.kind, lost: o.lost }));
     this.emit({ type: 'objects', objects, selectedId: this.selectedId });
   }
 
@@ -797,6 +976,7 @@ export class ArEngine {
    * would otherwise drag the object along with the camera.
    */
   setTouchEdit(enabled: boolean): void {
+    if (enabled !== this.touchEdit) this.log(`touch move ${enabled ? 'ON' : 'OFF'}`);
     this.touchEdit = enabled;
     if (!enabled && (this.gesture?.kind === 'drag' || this.gesture?.kind === 'two')) {
       const obj = this.findObject(this.gesture.objectId);
@@ -858,7 +1038,10 @@ export class ArEngine {
     // Store the new pose against the anchor once the gesture is over.
     if (editedId && !this.isBeingManipulated(editedId)) {
       const obj = this.findObject(editedId);
-      if (obj) this.touch(obj);
+      if (obj) {
+        this.log(`${this.label(obj)}: touch move ended at ${fmt(obj.root.position)}`);
+        this.touch(obj);
+      }
     }
   }
 
@@ -1014,6 +1197,7 @@ export class ArEngine {
       session.removeEventListener('visibilitychange', this.onVisibilityChange);
     }
     this.session = null;
+    this.log(this.endedByUser ? 'AR session ended (Exit AR)' : 'AR session ended by the browser');
     this.cleanupSession();
     this.emit({ type: 'ended', reason: this.endedByUser ? 'user' : 'browser' });
   };
