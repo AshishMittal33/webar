@@ -62,13 +62,16 @@ const SCAN_SWEEP_RAD = THREE.MathUtils.degToRad(60);
 const HINT_CLOSE_M = 0.6;
 /** ...or turning faster than this (rad/s), ARCore tends to lose tracking. */
 const HINT_FAST_RAD_S = 1.5;
+const HINT_WINDOW_MS = 250;
 
 /** A horizontal surface must be at least this far below the tablet to count as the floor. */
 const FLOOR_MIN_BELOW_CAMERA = 0.9;
+/** Nobody holds a tablet higher than this above the floor; deeper hits are false. */
+const FLOOR_MAX_BELOW_CAMERA = 2.0;
+const FLOOR_BUCKET_M = 0.05;
 
 /** Debug log: anchor corrections and frame stalls above these are recorded. */
 // After Done: how far to look for the real floor or wall, and for how long.
-const SETTLE_FLOOR_M = 0.25;
 const SETTLE_WALL_BEHIND_M = 0.8;
 const SETTLE_WALL_FRONT_M = 0.3;
 const SETTLE_FRAMES = 45;
@@ -232,10 +235,12 @@ export class ArEngine {
   /** True while that pose has only an estimated position (ARCore paused). */
   private poseEstimated = false;
   /** Object being settled onto the real surface behind it after Done. */
-  private settle: { obj: SceneObject; source: XRHitTestSource; frames: number } | null = null;
+  private settle: { obj: SceneObject; source: XRHitTestSource; frames: number; cameraY: number } | null = null;
 
   private hitTestSource: XRHitTestSource | null = null;
   private floorY: number | null = null;
+  /** Floor-height candidates from the scan, in FLOOR_BUCKET_M buckets. */
+  private floorVotes = new Map<number, { count: number; sum: number }>();
   private anchorsAvailable = false;
 
   private objects: SceneObject[] = [];
@@ -288,7 +293,8 @@ export class ArEngine {
   // Tracking hints
   private hint: TrackingHint | null = null;
   private closeFrames = 0;
-  private fastFrames = 0;
+  private fastWindows = 0;
+  private hintWindowMs = 0;
   private quietFrames = 0;
   private readonly lastViewQuat = new THREE.Quaternion();
   private hasLastViewQuat = false;
@@ -367,7 +373,8 @@ export class ArEngine {
     this.resetScan();
     this.hint = null;
     this.closeFrames = 0;
-    this.fastFrames = 0;
+    this.fastWindows = 0;
+    this.hintWindowMs = 0;
     this.quietFrames = 0;
     this.hasLastViewQuat = false;
     this.log('AR session requested');
@@ -681,7 +688,7 @@ export class ArEngine {
    * to a detected surface also follow ARCore's refinements of that surface.
    * When no surface is found the object keeps its current anchor.
    */
-  private startSettle(obj: SceneObject) {
+  private startSettle(obj: SceneObject, whileSelected = false) {
     const session = this.session;
     const refSpace = this.refSpace;
     const cam = this.cameraFrame();
@@ -689,10 +696,13 @@ export class ArEngine {
     if (this.settle) this.cancelSettle('another object finished');
 
     const p = obj.root.position;
+    const cameraY = cam.position.y;
     let origin: THREE.Vector3;
     let dir: THREE.Vector3;
     if (obj.spawn === 'floor') {
-      origin = p.clone().addScaledVector(UP, 1);
+      // From the tablet's height straight down, so the floor is found even
+      // when the object is below it.
+      origin = new THREE.Vector3(p.x, cameraY, p.z);
       dir = UP.clone().negate();
     } else {
       origin = cam.position.clone();
@@ -706,12 +716,12 @@ export class ArEngine {
     session
       .requestHitTestSource({ space: refSpace, offsetRay: ray })
       ?.then((source) => {
-        if (!this.objects.includes(obj) || this.selectedId === obj.id || this.session !== session) {
+        if (!this.objects.includes(obj) || (!whileSelected && this.selectedId === obj.id) || this.session !== session) {
           source.cancel();
           return;
         }
         this.settle?.source.cancel();
-        this.settle = { obj, source, frames: 0 };
+        this.settle = { obj, source, frames: 0, cameraY };
       })
       .catch((err) => this.log(`${this.label(obj)}: surface search unavailable (${String(err)})`));
   }
@@ -725,7 +735,7 @@ export class ArEngine {
 
   private updateSettle(frame: XRFrame, refSpace: XRReferenceSpace) {
     const s = this.settle;
-    if (!s || this.poseEstimated) return;
+    if (!s || this.poseEstimated || this.isBeingManipulated(s.obj.id)) return;
     s.frames += 1;
     const obj = s.obj;
     const p = obj.root.position;
@@ -742,8 +752,11 @@ export class ArEngine {
       let target: THREE.Vector3;
       let facing: THREE.Quaternion | null = null;
       if (floor) {
-        if (normal.y < 0.9 || Math.abs(hit.y - p.y) > SETTLE_FLOOR_M) continue;
+        // The first surface down that is low enough to be the floor (not a desk).
+        const below = s.cameraY - hit.y;
+        if (normal.y < 0.9 || below < FLOOR_MIN_BELOW_CAMERA || below > FLOOR_MAX_BELOW_CAMERA) continue;
         target = new THREE.Vector3(p.x, hit.y, p.z);
+        this.setFloor(hit.y, 'detected under the object');
       } else {
         if (Math.abs(normal.y) > 0.3) continue;
         // Distance from the TV's back to the wall, positive when the wall is behind it.
@@ -885,9 +898,29 @@ export class ArEngine {
    */
   private learnFloor() {
     const hit = this.centreHit;
-    if (!hit || !hit.horizontal || hit.belowCamera < FLOOR_MIN_BELOW_CAMERA) return;
+    if (!hit || !hit.horizontal || hit.belowCamera < FLOOR_MIN_BELOW_CAMERA || hit.belowCamera > FLOOR_MAX_BELOW_CAMERA) {
+      return;
+    }
+    // The floor is the height seen most often, not the lowest: a device log
+    // showed one false hit (a shiny tiled floor) putting a table 1 m under
+    // the real floor, where it slid against the room as the user walked.
+    const bucket = Math.round(hit.position.y / FLOOR_BUCKET_M);
+    const vote = this.floorVotes.get(bucket) ?? { count: 0, sum: 0 };
+    vote.count += 1;
+    vote.sum += hit.position.y;
+    this.floorVotes.set(bucket, vote);
+    let best = vote;
+    for (const v of this.floorVotes.values()) if (v.count > best.count) best = v;
+    this.setFloor(best.sum / best.count, 'scan');
+  }
+
+  private setFloor(y: number, source: string) {
     const wasKnown = this.floorY !== null;
-    this.floorY = wasKnown ? Math.min(this.floorY!, hit.position.y) : hit.position.y;
+    if (wasKnown && Math.abs(this.floorY! - y) < 0.02) return;
+    if (!wasKnown || Math.abs(this.floorY! - y) > 0.1) {
+      this.log(`floor at y = ${y.toFixed(2)} (${source})`);
+    }
+    this.floorY = y;
     if (!wasKnown) this.emit({ type: 'floor', known: true });
   }
 
@@ -981,15 +1014,24 @@ export class ArEngine {
   private updateHints(viewerPose: XRViewerPose, dt: number) {
     const q = viewerPose.transform.orientation;
     const quat = new THREE.Quaternion(q.x, q.y, q.z, q.w);
-    const speed = this.hasLastViewQuat && dt > 0 ? this.lastViewQuat.angleTo(quat) / (dt / 1000) : 0;
-    this.lastViewQuat.copy(quat);
-    this.hasLastViewQuat = true;
+    // Turning speed over a quarter second, not per frame: frame-to-frame
+    // pose jitter made slow, careful movement read as "too fast".
+    this.hintWindowMs += dt;
+    if (!this.hasLastViewQuat) {
+      this.lastViewQuat.copy(quat);
+      this.hasLastViewQuat = true;
+      this.hintWindowMs = 0;
+    } else if (this.hintWindowMs >= HINT_WINDOW_MS) {
+      const speed = this.lastViewQuat.angleTo(quat) / (this.hintWindowMs / 1000);
+      this.fastWindows = speed > HINT_FAST_RAD_S ? this.fastWindows + 1 : 0;
+      this.lastViewQuat.copy(quat);
+      this.hintWindowMs = 0;
+    }
 
     const close = this.centreHit !== null && this.centreHit.distance < HINT_CLOSE_M;
     this.closeFrames = close ? this.closeFrames + 1 : 0;
-    this.fastFrames = speed > HINT_FAST_RAD_S ? this.fastFrames + 1 : 0;
 
-    let next: TrackingHint | null = this.fastFrames > 4 ? 'too-fast' : this.closeFrames > 20 ? 'too-close' : null;
+    let next: TrackingHint | null = this.fastWindows >= 2 ? 'too-fast' : this.closeFrames > 20 ? 'too-close' : null;
     if (next === null && this.hint !== null) {
       this.quietFrames += 1;
       if (this.quietFrames < 45) next = this.hint;
@@ -1099,6 +1141,8 @@ export class ArEngine {
     this.selectedId = obj.id;
     this.updateOutlines();
     this.emitObjects();
+    // Put floor objects on the floor ARCore detects at that spot.
+    if (spec.spawn === 'floor') this.startSettle(obj, true);
     return obj.id;
   }
 
@@ -1621,6 +1665,7 @@ export class ArEngine {
     this.settle = null;
     this.poseEstimated = false;
     this.floorY = null;
+    this.floorVotes.clear();
     this.centreHit = null;
     this.resetScan();
     this.hint = null;
