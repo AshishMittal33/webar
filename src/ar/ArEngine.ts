@@ -316,16 +316,22 @@ export class ArEngine {
    * only allows requestSession with transient user activation, so nothing
    * here awaits before requestSession is invoked.
    */
-  async start(canvasHost: HTMLElement, overlayRoot: HTMLElement): Promise<void> {
+  async start(canvasHost: HTMLElement, overlayRoot: HTMLElement, options: { plain?: boolean } = {}): Promise<void> {
     if (this.session) throw new DOMException('Session already running', 'InvalidStateError');
     const xr = navigator.xr;
     if (!xr) throw new DOMException('WebXR not available', 'NotSupportedError');
 
-    const sessionPromise = xr.requestSession('immersive-ar', {
-      requiredFeatures: ['local'],
-      optionalFeatures: OPTIONAL_FEATURES,
-      domOverlay: { root: overlayRoot },
-    });
+    // Plain mode is a stability test that matches Google's WebXR anchors
+    // sample: no DOM overlay, no hit-testing, default resolution, simple
+    // shading. Tap the screen to place a TV. If objects hold still here but
+    // not in the normal mode, one of the extras is slowing ARCore down.
+    const plain = options.plain === true;
+    const sessionPromise = xr.requestSession(
+      'immersive-ar',
+      plain
+        ? { requiredFeatures: ['local'], optionalFeatures: ['anchors'] }
+        : { requiredFeatures: ['local'], optionalFeatures: OPTIONAL_FEATURES, domOverlay: { root: overlayRoot } },
+    );
 
     this.endedByUser = false;
     this.trackingState = 'initializing';
@@ -356,21 +362,23 @@ export class ArEngine {
     }
 
     this.session = session;
-    const renderer = this.createRenderer(canvasHost);
+    const renderer = this.createRenderer(canvasHost, plain);
     this.renderer = renderer;
 
     session.addEventListener('end', this.onSessionEnd);
     session.addEventListener('visibilitychange', this.onVisibilityChange);
+    if (plain) session.addEventListener('select', this.onPlainSelect);
 
     renderer.xr.setReferenceSpaceType('local');
-    const renderScale = computeRenderScale();
-    renderer.xr.setFramebufferScaleFactor(renderScale);
+    const renderScale = plain ? 1 : computeRenderScale();
+    if (!plain) renderer.xr.setFramebufferScaleFactor(renderScale);
     await renderer.xr.setSession(session);
 
     const info = this.collectSessionInfo(session, renderScale);
     this.anchorsAvailable = info.anchorsSupported;
     await this.setupHitTest(session, info);
     this.debugHeader = [
+      `mode: ${plain ? 'PLAIN (stability test: no overlay, no hit test, simple shading)' : 'normal'}`,
       `browser: ${navigator.userAgent}`,
       `screen: ${window.innerWidth}x${window.innerHeight} @ ${window.devicePixelRatio}x, render scale ${renderScale}`,
       `features: ${info.enabledFeatures.join(', ')}`,
@@ -382,12 +390,19 @@ export class ArEngine {
     this.refSpace = renderer.xr.getReferenceSpace();
     this.refSpace?.addEventListener('reset', this.onReferenceSpaceReset);
     this.lastCameraLogMs = 0;
-    this.log('AR session started');
+    this.log(plain ? 'AR session started in PLAIN mode: tap the screen to place a TV' : 'AR session started');
 
     renderer.setAnimationLoop(this.onFrame);
     this.emit({ type: 'started', info });
     this.emitObjects();
+    if (plain) this.finishScan(true);
   }
+
+  /** Plain mode: a screen tap places a TV in front of the user, unselected. */
+  private onPlainSelect = () => {
+    const id = this.spawn('tv');
+    if (id) this.select(null);
+  };
 
   /** Ends the session. Resolves after cleanup; safe to call twice. */
   async end(): Promise<void> {
@@ -407,7 +422,7 @@ export class ArEngine {
     this.fpsWindowStart = 0;
   }
 
-  private createRenderer(host: HTMLElement): THREE.WebGLRenderer {
+  private createRenderer(host: HTMLElement, plain: boolean): THREE.WebGLRenderer {
     const renderer = new THREE.WebGLRenderer({
       antialias: false,
       alpha: true,
@@ -419,14 +434,16 @@ export class ArEngine {
     renderer.setSize(host.clientWidth || window.innerWidth, host.clientHeight || window.innerHeight);
     renderer.xr.enabled = true;
     renderer.shadowMap.enabled = false;
-    renderer.toneMapping = THREE.ACESFilmicToneMapping;
-    renderer.toneMappingExposure = 1.05;
-    // A neutral room as reflection/ambient light: makes wood, fabric and the
-    // TV's metal frame look real at almost no per-frame cost.
-    const pmrem = new THREE.PMREMGenerator(renderer);
-    this.envTexture = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
-    pmrem.dispose();
-    this.scene.environment = this.envTexture;
+    if (!plain) {
+      renderer.toneMapping = THREE.ACESFilmicToneMapping;
+      renderer.toneMappingExposure = 1.05;
+      // A neutral room as reflection/ambient light: makes wood, fabric and
+      // the TV's metal frame look real at almost no per-frame cost.
+      const pmrem = new THREE.PMREMGenerator(renderer);
+      this.envTexture = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
+      pmrem.dispose();
+      this.scene.environment = this.envTexture;
+    }
     host.appendChild(renderer.domElement);
     return renderer;
   }
@@ -1404,6 +1421,7 @@ export class ArEngine {
     if (session) {
       session.removeEventListener('end', this.onSessionEnd);
       session.removeEventListener('visibilitychange', this.onVisibilityChange);
+      session.removeEventListener('select', this.onPlainSelect);
     }
     this.session = null;
     this.log(this.endedByUser ? 'AR session ended (Exit AR)' : 'AR session ended by the browser');

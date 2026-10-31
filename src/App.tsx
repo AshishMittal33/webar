@@ -120,11 +120,11 @@ function ArApp() {
   }, [engine]);
 
   // Called synchronously from the Start button tap so user activation is kept.
-  const handleStart = () => {
+  const handleStart = (plain = false) => {
     if (!canvasHost.current || !overlayRoot) return;
     setNotice(null);
     setScreen('ar');
-    engine.start(canvasHost.current, overlayRoot).catch((err) => {
+    engine.start(canvasHost.current, overlayRoot, { plain }).catch((err) => {
       setNotice(describeArError(err));
       setScreen('landing');
     });
@@ -226,7 +226,8 @@ function ArApp() {
     <>
       {screen === 'landing' && (
         <Landing
-          onStart={handleStart}
+          onStart={() => handleStart(false)}
+          onStartPlain={() => handleStart(true)}
           notice={notice}
           getDebugLog={engine.hasDebugLog ? () => engine.getDebugLog() : undefined}
         />

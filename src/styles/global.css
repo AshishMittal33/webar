@@ -68,6 +68,13 @@ button:disabled {
   background: var(--accent-strong);
 }
 
+.btn-secondary {
+  width: 100%;
+  font-weight: 600;
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+}
+
 .btn-ghost {
   background: transparent;
   color: var(--muted);

@@ -5,13 +5,15 @@ import DebugLogButton from './DebugLogButton';
 
 interface LandingProps {
   onStart: () => void;
+  /** Stability test: AR without overlay or extras, like Google's demo. */
+  onStartPlain: () => void;
   /** Message from a previous attempt (permission denied, session ended...). */
   notice?: ArError | null;
   /** Present after an AR session, so its log can be copied after exiting. */
   getDebugLog?: () => string;
 }
 
-export default function Landing({ onStart, notice, getDebugLog }: LandingProps) {
+export default function Landing({ onStart, onStartPlain, notice, getDebugLog }: LandingProps) {
   const [report, setReport] = useState<SupportReport | null>(null);
   const [showDiag, setShowDiag] = useState(false);
 
@@ -94,6 +96,17 @@ export default function Landing({ onStart, notice, getDebugLog }: LandingProps) 
           HTTPS.
         </p>
       )}
+
+      <section className="card">
+        <strong>Stability test (plain mode)</strong>
+        <p className="hint">
+          AR with no buttons and no extra processing, the same as Google's demo. Tap the screen to place a TV in
+          front of you, then walk around it. Press the tablet's Back button to exit.
+        </p>
+        <button className="btn-secondary" disabled={!canStart} onClick={onStartPlain}>
+          Start plain mode
+        </button>
+      </section>
 
       {getDebugLog && (
         <section className="card">
