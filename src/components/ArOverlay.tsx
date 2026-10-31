@@ -13,6 +13,9 @@ interface ArOverlayProps {
   objects: ObjectSummary[];
   selectedId: string | null;
   canUndo: boolean;
+  /** When false, touching the screen can select objects but never move them. */
+  touchEdit: boolean;
+  onTouchEditChange: (enabled: boolean) => void;
   onSpawn: (kind: ObjectKind) => void;
   onNudge: (dx: number, dy: number, dz: number) => void;
   onRotate: (degrees: number) => void;
@@ -48,14 +51,16 @@ const STEP_M = 0.05;
 const STEP_DEG = 10;
 const STEP_SCALE = 1.1;
 
-function guidance(tracking: TrackingState, hasObjects: boolean, hasSelection: boolean): string {
+function guidance(tracking: TrackingState, hasObjects: boolean, hasSelection: boolean, touchEdit: boolean): string {
   if (tracking === 'initializing') return 'Move your phone slowly over the floor to scan the area.';
   if (tracking === 'lost')
     return 'Camera tracking paused, objects hidden until it resumes. Aim at something with texture and move slowly.';
   if (tracking === 'limited') return 'Tracking is weak here. Move slowly; textured surfaces help.';
   if (!hasObjects) return 'Tap + TV or + Box to add an object in front of you.';
   if (!hasSelection) return 'Tap an object to select it.';
-  return 'Put a finger on the object and drag. Add a second finger to pinch, twist or push. Tap Done to lock it.';
+  if (touchEdit)
+    return 'Touch move is ON: drag with a finger on the object, add a second finger to pinch, twist or push. Turn it off when done.';
+  return 'Locked: touching the screen will not move it. Use the buttons, or turn Touch move on to drag, pinch and twist.';
 }
 
 /**
@@ -73,6 +78,8 @@ export default function ArOverlay({
   objects,
   selectedId,
   canUndo,
+  touchEdit,
+  onTouchEditChange,
   onSpawn,
   onNudge,
   onRotate,
@@ -185,7 +192,7 @@ export default function ArOverlay({
         <div className="ar-guide">
           {paused
             ? 'AR is paused. Return to this tab to continue.'
-            : guidance(tracking, objects.length > 0, !!selected)}
+            : guidance(tracking, objects.length > 0, !!selected, touchEdit)}
         </div>
 
         {selected ? (
@@ -194,9 +201,18 @@ export default function ArOverlay({
               <span>
                 {selected.kind === 'tv' ? 'TV' : 'Box'} {selectedIndex} of {objects.length}
               </span>
-              <button className="ar-chip" onClick={onDeselect}>
-                Done
-              </button>
+              <div className="ar-pad-title-actions">
+                <button
+                  className={`ar-chip ${touchEdit ? 'on' : 'off'}`}
+                  aria-pressed={touchEdit}
+                  onClick={() => onTouchEditChange(!touchEdit)}
+                >
+                  Touch move: {touchEdit ? 'ON' : 'OFF'}
+                </button>
+                <button className="ar-chip" onClick={onDeselect}>
+                  Done
+                </button>
+              </div>
             </div>
             <div className="ar-pad-grid">
               <button onClick={() => onNudge(-STEP_M, 0, 0)}>◀ Left</button>

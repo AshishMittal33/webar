@@ -153,7 +153,7 @@ type Gesture =
       twistOn: boolean;
       pushOn: boolean;
     }
-  | { kind: 'tap-empty'; pointerId: number; startX: number; startY: number; moved: boolean };
+  | { kind: 'tap'; pointerId: number; startX: number; startY: number; moved: boolean; objectId: string | null };
 
 type FeatureSession = XRSession & { enabledFeatures?: string[] };
 
@@ -192,6 +192,8 @@ export class ArEngine {
 
   private pointers = new Map<number, { x: number; y: number }>();
   private gesture: Gesture | null = null;
+  /** Touch may move objects only after the user switches this on. */
+  private touchEdit = false;
   private readonly raycaster = new THREE.Raycaster();
   private readonly outlineMaterial = new THREE.LineBasicMaterial({ color: 0xf5b942 });
 
@@ -790,6 +792,20 @@ export class ArEngine {
   // ----- Gestures -----
 
   /**
+   * Allow or forbid touch gestures from moving objects. Off by default: a
+   * thumb resting on an object while the user holds and moves the device
+   * would otherwise drag the object along with the camera.
+   */
+  setTouchEdit(enabled: boolean): void {
+    this.touchEdit = enabled;
+    if (!enabled && (this.gesture?.kind === 'drag' || this.gesture?.kind === 'two')) {
+      const obj = this.findObject(this.gesture.objectId);
+      this.gesture = null;
+      if (obj) this.touch(obj);
+    }
+  }
+
+  /**
    * One finger: tap an object to select it; drag a selected object to slide
    * it (floor objects on the floor plane, wall objects on a plane facing the
    * user). Tap empty space to deselect.
@@ -811,7 +827,7 @@ export class ArEngine {
         // the object. Two touches on empty space (hands holding the
         // device) do nothing, and must not deselect either.
         if (this.gesture?.kind === 'drag') this.beginTwoFinger();
-        else if (this.gesture?.kind === 'tap-empty') this.gesture.moved = true;
+        else if (this.gesture?.kind === 'tap') this.gesture.moved = true;
       }
       return;
     }
@@ -821,18 +837,18 @@ export class ArEngine {
       this.pointers.set(e.id, { x: e.x, y: e.y });
       if (this.gesture?.kind === 'drag' && this.gesture.pointerId === e.id) this.moveDrag(e);
       else if (this.gesture?.kind === 'two' && this.pointers.size === 2) this.moveTwoFinger();
-      else if (this.gesture?.kind === 'tap-empty' && this.gesture.pointerId === e.id) {
+      else if (this.gesture?.kind === 'tap' && this.gesture.pointerId === e.id) {
         if (Math.hypot(e.x - this.gesture.startX, e.y - this.gesture.startY) > TAP_SLOP) this.gesture.moved = true;
       }
       return;
     }
 
     // up / cancel
-    const wasTapEmpty = this.gesture?.kind === 'tap-empty' && !this.gesture.moved && e.type === 'up';
+    const tap = this.gesture?.kind === 'tap' && !this.gesture.moved && e.type === 'up' ? this.gesture : null;
     const editedId =
       this.gesture?.kind === 'drag' || this.gesture?.kind === 'two' ? this.gesture.objectId : null;
     this.pointers.delete(e.id);
-    if (wasTapEmpty) this.select(null);
+    if (tap) this.select(tap.objectId);
     if (this.pointers.size === 0) this.gesture = null;
     else if (this.pointers.size === 1 && this.gesture?.kind === 'two') {
       // Lifted one of two fingers: stop the two-finger gesture, no new drag
@@ -850,8 +866,9 @@ export class ArEngine {
     const ray = this.rayFromScreen(e.x, e.y);
     if (!ray) return;
     const hitObj = this.pickObject(ray);
-    if (!hitObj) {
-      this.gesture = { kind: 'tap-empty', pointerId: e.id, startX: e.x, startY: e.y, moved: false };
+    // Unless touch move is on, a touch can only select (or deselect).
+    if (!hitObj || !this.touchEdit) {
+      this.gesture = { kind: 'tap', pointerId: e.id, startX: e.x, startY: e.y, moved: false, objectId: hitObj?.id ?? null };
       return;
     }
     if (hitObj.id !== this.selectedId) this.select(hitObj.id);

@@ -473,3 +473,20 @@ ul.steps {
 .ar-actions .ar-place {
   min-height: 52px;
 }
+
+/* ---------- Touch move toggle ---------- */
+
+.ar-pad-title-actions {
+  display: flex;
+  gap: 6px;
+}
+
+.ar-chip.off {
+  background: var(--surface-2);
+  color: var(--text);
+}
+
+.ar-chip.on {
+  background: var(--ok);
+  color: #062b16;
+}

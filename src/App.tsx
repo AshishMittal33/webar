@@ -35,6 +35,11 @@ export default function App() {
   const [objects, setObjects] = useState<ObjectSummary[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [canUndo, setCanUndo] = useState(false);
+  const [touchEdit, setTouchEditState] = useState(false);
+  const setTouchEdit = (enabled: boolean) => {
+    setTouchEditState(enabled);
+    engine.setTouchEdit(enabled);
+  };
 
   useEffect(() => {
     return engine.subscribe((e) => {
@@ -60,6 +65,11 @@ export default function App() {
         case 'objects':
           setObjects(e.objects);
           setSelectedId(e.selectedId);
+          // Deselecting always locks objects against touch again.
+          if (e.selectedId === null) {
+            setTouchEditState(false);
+            engine.setTouchEdit(false);
+          }
           setCanUndo(engine.canUndo);
           break;
         case 'ended':
@@ -68,6 +78,8 @@ export default function App() {
           setObjects([]);
           setSelectedId(null);
           setCanUndo(false);
+          setTouchEditState(false);
+          engine.setTouchEdit(false);
           if (e.reason === 'browser') {
             setNotice({
               code: 'SessionEnded',
@@ -184,6 +196,8 @@ export default function App() {
             objects={objects}
             selectedId={selectedId}
             canUndo={canUndo}
+            touchEdit={touchEdit}
+            onTouchEditChange={setTouchEdit}
             onSpawn={handleSpawn}
             onNudge={handleNudge}
             onRotate={handleRotate}
