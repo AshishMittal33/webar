@@ -67,6 +67,12 @@ const HINT_FAST_RAD_S = 1.5;
 const FLOOR_MIN_BELOW_CAMERA = 0.9;
 
 /** Debug log: anchor corrections and frame stalls above these are recorded. */
+// After Done: how far to look for the real floor or wall, and for how long.
+const SETTLE_FLOOR_M = 0.25;
+const SETTLE_WALL_BEHIND_M = 0.8;
+const SETTLE_WALL_FRONT_M = 0.3;
+const SETTLE_FRAMES = 45;
+
 const LOG_JUMP_M = 0.05;
 const LOG_LONG_FRAME_MS = 120;
 const DEBUG_LOG_LIMIT = 400;
@@ -223,6 +229,10 @@ export class ArEngine {
   private limitedFrames = 0;
   /** True on frames where WebXR gave a viewer pose. */
   private hasPose = false;
+  /** True while that pose has only an estimated position (ARCore paused). */
+  private poseEstimated = false;
+  /** Object being settled onto the real surface behind it after Done. */
+  private settle: { obj: SceneObject; source: XRHitTestSource; frames: number } | null = null;
 
   private hitTestSource: XRHitTestSource | null = null;
   private floorY: number | null = null;
@@ -519,8 +529,19 @@ export class ArEngine {
       // Like the WebXR samples: with no viewer pose there is nothing correct
       // to draw. Three.js would otherwise reuse the last camera and the
       // objects would look glued to the screen.
-      this.scene.visible = this.hasPose;
+      //
+      // An "emulated" pose means ARCore has paused and only the rotation is
+      // live: drawn with it, objects keep their place on screen while the
+      // phone moves, which is exactly the "object moves with the camera"
+      // effect. Hide them until real tracking resumes.
+      const estimated = viewerPose !== null && viewerPose.emulatedPosition;
+      if (estimated !== this.poseEstimated) {
+        this.poseEstimated = estimated;
+        this.log(estimated ? 'camera position estimated only (ARCore paused), objects hidden' : 'camera position tracked again');
+      }
+      this.scene.visible = this.hasPose && !estimated;
       if (refSpace && viewerPose) {
+        this.updateSettle(frame, refSpace);
         this.readCentreHit(frame, refSpace, viewerPose);
         this.learnFloor();
         this.updateScan(viewerPose, dt);
@@ -648,6 +669,129 @@ export class ArEngine {
     const shift = t ? ` (origin shifted by ${fmt(new THREE.Vector3(t.position.x, t.position.y, t.position.z))})` : '';
     this.log(`ARCORE RESET its world coordinates${shift}`);
   };
+
+  // ----- Settling onto real surfaces -----
+
+  /**
+   * After Done, looks for the real floor under a floor object, or the wall
+   * behind a TV. If ARCore knows that surface, the object is moved flush
+   * onto it and anchored to it. An object floating in front of the wall
+   * shifts against the wall as the user walks (parallax), which looks like
+   * it is moving with the camera; one on the wall cannot. Anchors attached
+   * to a detected surface also follow ARCore's refinements of that surface.
+   * When no surface is found the object keeps its current anchor.
+   */
+  private startSettle(obj: SceneObject) {
+    const session = this.session;
+    const refSpace = this.refSpace;
+    const cam = this.cameraFrame();
+    if (!session?.requestHitTestSource || !refSpace || !cam || !this.anchorsAvailable || !this.canEdit) return;
+    if (this.settle) this.cancelSettle('another object finished');
+
+    const p = obj.root.position;
+    let origin: THREE.Vector3;
+    let dir: THREE.Vector3;
+    if (obj.spawn === 'floor') {
+      origin = p.clone().addScaledVector(UP, 1);
+      dir = UP.clone().negate();
+    } else {
+      origin = cam.position.clone();
+      dir = p.clone().sub(origin);
+      dir.y = 0;
+      if (dir.lengthSq() < 1e-6) return;
+      dir.normalize();
+      origin.y = p.y;
+    }
+    const ray = new XRRay({ x: origin.x, y: origin.y, z: origin.z, w: 1 }, { x: dir.x, y: dir.y, z: dir.z, w: 0 });
+    session
+      .requestHitTestSource({ space: refSpace, offsetRay: ray })
+      ?.then((source) => {
+        if (!this.objects.includes(obj) || this.selectedId === obj.id || this.session !== session) {
+          source.cancel();
+          return;
+        }
+        this.settle?.source.cancel();
+        this.settle = { obj, source, frames: 0 };
+      })
+      .catch((err) => this.log(`${this.label(obj)}: surface search unavailable (${String(err)})`));
+  }
+
+  private cancelSettle(reason: string) {
+    if (!this.settle) return;
+    this.settle.source.cancel();
+    this.log(`${this.label(this.settle.obj)}: surface search stopped (${reason})`);
+    this.settle = null;
+  }
+
+  private updateSettle(frame: XRFrame, refSpace: XRReferenceSpace) {
+    const s = this.settle;
+    if (!s || this.poseEstimated) return;
+    s.frames += 1;
+    const obj = s.obj;
+    const p = obj.root.position;
+    const floor = obj.spawn === 'floor';
+
+    for (const result of frame.getHitTestResults(s.source)) {
+      const pose = result.getPose(refSpace);
+      if (!pose) continue;
+      const t = pose.transform;
+      const hit = new THREE.Vector3(t.position.x, t.position.y, t.position.z);
+      const q = new THREE.Quaternion(t.orientation.x, t.orientation.y, t.orientation.z, t.orientation.w);
+      const normal = UP.clone().applyQuaternion(q);
+
+      let target: THREE.Vector3;
+      let facing: THREE.Quaternion | null = null;
+      if (floor) {
+        if (normal.y < 0.9 || Math.abs(hit.y - p.y) > SETTLE_FLOOR_M) continue;
+        target = new THREE.Vector3(p.x, hit.y, p.z);
+      } else {
+        if (Math.abs(normal.y) > 0.3) continue;
+        // Distance from the TV's back to the wall, positive when the wall is behind it.
+        const gap = new THREE.Vector3().subVectors(p, hit).dot(normal);
+        if (gap > SETTLE_WALL_FRONT_M || gap < -SETTLE_WALL_BEHIND_M) continue;
+        target = p.clone().addScaledVector(normal, -gap);
+        facing = quatFacing(normal);
+      }
+
+      this.settle = null;
+      s.source.cancel();
+      const moved = target.distanceTo(p);
+      obj.root.position.copy(target);
+      if (facing) obj.root.quaternion.copy(facing);
+      // Keep following the old anchor from the new pose until the surface
+      // anchor's first pose arrives.
+      if (obj.anchor && obj.offsetValid) this.recomputeOffset(obj);
+      this.log(`${this.label(obj)}: put on the ${floor ? 'floor' : 'wall'} (${Math.round(moved * 100)} cm), anchoring to it`);
+
+      if (typeof result.createAnchor !== 'function') return;
+      obj.anchorPending = true;
+      result
+        .createAnchor()
+        .then((anchor) => {
+          obj.anchorPending = false;
+          if (!this.objects.includes(obj)) {
+            anchor.delete();
+            return;
+          }
+          obj.anchor?.delete();
+          obj.anchor = anchor;
+          obj.needsAnchor = false;
+          obj.untrackedSince = 0;
+          obj.lost = false;
+          obj.offsetValid = false;
+          this.log(`${this.label(obj)}: anchored to the ${floor ? 'floor' : 'wall'} surface`);
+        })
+        .catch((err) => {
+          obj.anchorPending = false;
+          this.log(`${this.label(obj)}: surface anchor FAILED (${String(err)}), keeping the old anchor`);
+        });
+      return;
+    }
+
+    if (s.frames >= SETTLE_FRAMES) {
+      this.cancelSettle(`no ${floor ? 'floor' : 'wall'} detected there, kept where you put it`);
+    }
+  }
 
   private label(obj: SceneObject): string {
     return `${getModelSpec(obj.kind).label} ${obj.id}`;
@@ -908,7 +1052,7 @@ export class ArEngine {
 
   /** Editing maps the screen through the live camera, so it needs a pose. */
   private get canEdit(): boolean {
-    return this.hasPose;
+    return this.hasPose && !this.poseEstimated;
   }
 
   /** World-space camera position and horizontal forward/right directions. */
@@ -1022,6 +1166,8 @@ export class ArEngine {
     const next = this.findObject(id);
     if (next) this.log(`${this.label(next)}: selected`);
     else if (previous) this.log(`${this.label(previous)}: Done (deselected) at ${fmt(previous.root.position)}`);
+    if (this.settle && this.settle.obj.id === id) this.cancelSettle('selected again');
+    if (previous) this.startSettle(previous);
     this.updateOutlines();
     this.emitObjects();
   }
@@ -1166,6 +1312,10 @@ export class ArEngine {
   }
 
   private removeObject(obj: SceneObject) {
+    if (this.settle?.obj === obj) {
+      this.settle.source.cancel();
+      this.settle = null;
+    }
     this.scene.remove(obj.root);
     obj.outline.geometry.dispose();
     obj.anchor?.delete();
@@ -1468,6 +1618,8 @@ export class ArEngine {
 
     this.hitTestSource?.cancel();
     this.hitTestSource = null;
+    this.settle = null;
+    this.poseEstimated = false;
     this.floorY = null;
     this.centreHit = null;
     this.resetScan();
