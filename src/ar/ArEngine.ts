@@ -229,6 +229,8 @@ export class ArEngine {
   private sessionStartMs = 0;
   private lastFrameMs = 0;
   private noPoseSince = 0;
+  private lastCameraLogMs = 0;
+  private refSpace: XRReferenceSpace | null = null;
 
   constructor() {
     const hemi = new THREE.HemisphereLight(0xffffff, 0x667799, 1.0);
@@ -311,6 +313,12 @@ export class ArEngine {
       `features: ${info.enabledFeatures.join(', ')}`,
       `hit-test: ${info.hitTestSupported ? 'yes' : 'no'}, anchors: ${info.anchorsSupported ? 'yes' : 'no'}`,
     ];
+    // ARCore fires 'reset' when it discards its map and the coordinate
+    // origin jumps. Objects anchored before a reset can only come back if
+    // ARCore later recognises the room again.
+    this.refSpace = renderer.xr.getReferenceSpace();
+    this.refSpace?.addEventListener('reset', this.onReferenceSpaceReset);
+    this.lastCameraLogMs = 0;
     this.log('AR session started');
 
     renderer.setAnimationLoop(this.onFrame);
@@ -398,7 +406,13 @@ export class ArEngine {
       if (hadPose && !this.hasPose) {
         this.noPoseSince = now;
         this.log('camera tracking LOST (no camera pose), objects hidden');
-      } else if (!hadPose && this.hasPose) {
+      } else if (viewerPose && now - this.lastCameraLogMs > 10000) {
+        // Periodic camera position: shows drift or jumps in ARCore's coordinates.
+        const p = viewerPose.transform.position;
+        this.log(`camera at ${fmt(new THREE.Vector3(p.x, p.y, p.z))}`);
+        this.lastCameraLogMs = now;
+      }
+      if (!hadPose && this.hasPose) {
         this.log(
           this.noPoseSince
             ? `camera tracking back after ${((now - this.noPoseSince) / 1000).toFixed(1)} s`
@@ -527,6 +541,12 @@ export class ArEngine {
       fail(err);
     }
   }
+
+  private onReferenceSpaceReset = (event: Event) => {
+    const t = (event as XRReferenceSpaceEvent).transform;
+    const shift = t ? ` (origin shifted by ${fmt(new THREE.Vector3(t.position.x, t.position.y, t.position.z))})` : '';
+    this.log(`ARCORE RESET its world coordinates${shift}`);
+  };
 
   private label(obj: SceneObject): string {
     return `${obj.kind === 'tv' ? 'TV' : 'Box'} ${obj.id}`;
@@ -1198,6 +1218,8 @@ export class ArEngine {
     }
     this.session = null;
     this.log(this.endedByUser ? 'AR session ended (Exit AR)' : 'AR session ended by the browser');
+    this.refSpace?.removeEventListener('reset', this.onReferenceSpaceReset);
+    this.refSpace = null;
     this.cleanupSession();
     this.emit({ type: 'ended', reason: this.endedByUser ? 'user' : 'browser' });
   };
