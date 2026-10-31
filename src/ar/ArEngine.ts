@@ -1,4 +1,5 @@
 import * as THREE from 'three';
+import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js';
 import { getModelSpec } from './models';
 import {
   describeArError,
@@ -7,6 +8,7 @@ import {
   type ObjectKind,
   type ObjectSummary,
   type SessionInfo,
+  type TrackingHint,
   type TrackingState,
 } from './types';
 
@@ -43,6 +45,23 @@ const REANCHOR_DISTANCE = 0.5;
 const LOST_AFTER_MS = 3000;
 /** Wait before retrying a failed anchor creation. */
 const ANCHOR_RETRY_MS = 1000;
+
+/**
+ * Room scan before placing. ARCore recovers from tracking drops by
+ * recognising places it has already mapped, so a short guided sweep over the
+ * floor and the wall gives it something to come back to. Progress averages
+ * three parts: time with good tracking, distinct surface spots seen by the
+ * centre hit test (30 cm grid), and how far the view was swept left/right.
+ */
+const SCAN_TIME_MS = 6000;
+const SCAN_CELLS = 14;
+const SCAN_CELL_M = 0.3;
+const SCAN_SWEEP_RAD = THREE.MathUtils.degToRad(60);
+
+/** Hints: closer than this to the surface at the screen centre... */
+const HINT_CLOSE_M = 0.6;
+/** ...or turning faster than this (rad/s), ARCore tends to lose tracking. */
+const HINT_FAST_RAD_S = 2.2;
 
 /** Debug log: anchor corrections and frame stalls above these are recorded. */
 const LOG_JUMP_M = 0.05;
@@ -232,11 +251,49 @@ export class ArEngine {
   private lastCameraLogMs = 0;
   private refSpace: XRReferenceSpace | null = null;
 
+  /** Surface under the screen centre this frame, from the hit test. */
+  private centreHit: { position: THREE.Vector3; matrix: THREE.Matrix4; distance: number; horizontal: boolean } | null =
+    null;
+
+  // Room scan
+  private scanning = true;
+  private scanEmitted = 0;
+  private scanTrackedMs = 0;
+  private scanCells = new Set<string>();
+  private scanYaw = 0;
+  private scanYawMin = 0;
+  private scanYawMax = 0;
+  private scanLastYaw: number | null = null;
+  private readonly scanReticle: THREE.Mesh;
+
+  // Tracking hints
+  private hint: TrackingHint | null = null;
+  private closeFrames = 0;
+  private fastFrames = 0;
+  private quietFrames = 0;
+  private readonly lastViewQuat = new THREE.Quaternion();
+  private hasLastViewQuat = false;
+
+  private envTexture: THREE.Texture | null = null;
+
   constructor() {
-    const hemi = new THREE.HemisphereLight(0xffffff, 0x667799, 1.0);
-    const dir = new THREE.DirectionalLight(0xffffff, 0.8);
-    dir.position.set(0.5, 1, 0.25);
+    // Image-based lighting (set per session in createRenderer) does most of
+    // the work; these add a soft key light so shapes read clearly.
+    const hemi = new THREE.HemisphereLight(0xffffff, 0x8a8f9c, 0.6);
+    const dir = new THREE.DirectionalLight(0xffffff, 1.1);
+    dir.position.set(0.6, 1.4, 0.8);
     this.scene.add(hemi, dir);
+
+    // Scan indicator: a ring lying on whatever surface the centre hit finds.
+    const ring = new THREE.RingGeometry(0.07, 0.09, 40);
+    ring.rotateX(-Math.PI / 2);
+    this.scanReticle = new THREE.Mesh(
+      ring,
+      new THREE.MeshBasicMaterial({ color: 0x4f8cff, transparent: true, opacity: 0.9, toneMapped: false }),
+    );
+    this.scanReticle.matrixAutoUpdate = false;
+    this.scanReticle.visible = false;
+    this.scene.add(this.scanReticle);
   }
 
   subscribe(listener: EngineListener): () => void {
@@ -282,6 +339,12 @@ export class ArEngine {
     this.noPoseSince = 0;
     this.debugLines = [];
     this.debugHeader = [];
+    this.resetScan();
+    this.hint = null;
+    this.closeFrames = 0;
+    this.fastFrames = 0;
+    this.quietFrames = 0;
+    this.hasLastViewQuat = false;
     this.log('AR session requested');
 
     let session: XRSession;
@@ -356,6 +419,14 @@ export class ArEngine {
     renderer.setSize(host.clientWidth || window.innerWidth, host.clientHeight || window.innerHeight);
     renderer.xr.enabled = true;
     renderer.shadowMap.enabled = false;
+    renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    renderer.toneMappingExposure = 1.05;
+    // A neutral room as reflection/ambient light: makes wood, fabric and the
+    // TV's metal frame look real at almost no per-frame cost.
+    const pmrem = new THREE.PMREMGenerator(renderer);
+    this.envTexture = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
+    pmrem.dispose();
+    this.scene.environment = this.envTexture;
     host.appendChild(renderer.domElement);
     return renderer;
   }
@@ -392,9 +463,8 @@ export class ArEngine {
     if (!renderer) return;
 
     const now = performance.now();
-    if (this.lastFrameMs && now - this.lastFrameMs > LOG_LONG_FRAME_MS) {
-      this.log(`slow frame: ${Math.round(now - this.lastFrameMs)} ms`);
-    }
+    const dt = this.lastFrameMs ? now - this.lastFrameMs : 0;
+    if (dt > LOG_LONG_FRAME_MS) this.log(`slow frame: ${Math.round(dt)} ms`);
     this.lastFrameMs = now;
 
     if (frame) {
@@ -424,9 +494,14 @@ export class ArEngine {
       // to draw. Three.js would otherwise reuse the last camera and the
       // objects would look glued to the screen.
       this.scene.visible = this.hasPose;
-      if (refSpace && this.hasPose) {
-        this.learnFloor(frame, refSpace);
+      if (refSpace && viewerPose) {
+        this.readCentreHit(frame, refSpace, viewerPose);
+        this.learnFloor();
+        this.updateScan(viewerPose, dt);
+        this.updateHints(viewerPose, dt);
         this.updateAnchors(frame, refSpace);
+      } else {
+        this.centreHit = null;
       }
     }
     this.countFrame(time);
@@ -549,7 +624,7 @@ export class ArEngine {
   };
 
   private label(obj: SceneObject): string {
-    return `${obj.kind === 'tv' ? 'TV' : 'Box'} ${obj.id}`;
+    return `${getModelSpec(obj.kind).label} ${obj.id}`;
   }
 
   private log(message: string) {
@@ -611,20 +686,134 @@ export class ArEngine {
     }
   }
 
-  /** Keeps the lowest horizontal hit seen so floor objects spawn on the floor. */
-  private learnFloor(frame: XRFrame, refSpace: XRReferenceSpace) {
+  /** Reads the surface under the screen centre once per frame. */
+  private readCentreHit(frame: XRFrame, refSpace: XRReferenceSpace, viewerPose: XRViewerPose) {
+    this.centreHit = null;
     if (!this.hitTestSource) return;
     const results = frame.getHitTestResults(this.hitTestSource);
-    if (results.length === 0) return;
-    const pose = results[0].getPose(refSpace);
+    const pose = results.length > 0 ? results[0].getPose(refSpace) : null;
     if (!pose) return;
+    const p = pose.transform.position;
     const q = pose.transform.orientation;
+    const v = viewerPose.transform.position;
+    const position = new THREE.Vector3(p.x, p.y, p.z);
     const normal = UP.clone().applyQuaternion(new THREE.Quaternion(q.x, q.y, q.z, q.w));
-    if (normal.y < 0.75) return;
-    const y = pose.transform.position.y;
+    this.centreHit = {
+      position,
+      matrix: new THREE.Matrix4().fromArray(pose.transform.matrix),
+      distance: position.distanceTo(new THREE.Vector3(v.x, v.y, v.z)),
+      horizontal: normal.y > 0.75,
+    };
+  }
+
+  /** Keeps the lowest horizontal hit seen so floor objects spawn on the floor. */
+  private learnFloor() {
+    const hit = this.centreHit;
+    if (!hit || !hit.horizontal) return;
     const wasKnown = this.floorY !== null;
-    this.floorY = wasKnown ? Math.min(this.floorY!, y) : y;
+    this.floorY = wasKnown ? Math.min(this.floorY!, hit.position.y) : hit.position.y;
     if (!wasKnown) this.emit({ type: 'floor', known: true });
+  }
+
+  // ----- Room scan -----
+
+  private updateScan(viewerPose: XRViewerPose, dt: number) {
+    if (!this.scanning) return;
+    const hit = this.centreHit;
+    this.scanReticle.visible = hit !== null;
+    if (hit) this.scanReticle.matrix.copy(hit.matrix);
+    if (this.trackingState !== 'tracking') return;
+
+    this.scanTrackedMs += Math.min(dt, 100);
+    if (hit && this.scanCells.size < 500) {
+      const c = SCAN_CELL_M;
+      this.scanCells.add(
+        `${Math.round(hit.position.x / c)},${Math.round(hit.position.y / c)},${Math.round(hit.position.z / c)}`,
+      );
+    }
+    const q = viewerPose.transform.orientation;
+    const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(new THREE.Quaternion(q.x, q.y, q.z, q.w));
+    const yaw = Math.atan2(forward.x, forward.z);
+    if (this.scanLastYaw !== null) {
+      const d = yaw - this.scanLastYaw;
+      this.scanYaw += Math.atan2(Math.sin(d), Math.cos(d));
+      this.scanYawMin = Math.min(this.scanYawMin, this.scanYaw);
+      this.scanYawMax = Math.max(this.scanYawMax, this.scanYaw);
+    }
+    this.scanLastYaw = yaw;
+
+    const progress =
+      (Math.min(1, this.scanTrackedMs / SCAN_TIME_MS) +
+        Math.min(1, this.scanCells.size / SCAN_CELLS) +
+        Math.min(1, (this.scanYawMax - this.scanYawMin) / SCAN_SWEEP_RAD)) /
+      3;
+    if (progress >= 0.999) this.finishScan(false);
+    else if (progress - this.scanEmitted >= 0.02) {
+      this.scanEmitted = progress;
+      this.emit({ type: 'scan', progress, done: false });
+    }
+  }
+
+  /** Lets the user place objects without finishing the scan. */
+  skipScan(): void {
+    if (this.scanning) this.finishScan(true);
+  }
+
+  private finishScan(skipped: boolean) {
+    this.scanning = false;
+    this.scanReticle.visible = false;
+    this.scanEmitted = 1;
+    const sweep = Math.round(THREE.MathUtils.radToDeg(this.scanYawMax - this.scanYawMin));
+    this.log(
+      `room scan ${skipped ? 'SKIPPED' : 'complete'}: ${(this.scanTrackedMs / 1000).toFixed(1)} s tracked, ` +
+        `${this.scanCells.size} surface spots, ${sweep} deg sweep`,
+    );
+    this.emit({ type: 'scan', progress: 1, done: true });
+  }
+
+  private resetScan() {
+    this.scanning = true;
+    this.scanEmitted = 0;
+    this.scanTrackedMs = 0;
+    this.scanCells.clear();
+    this.scanYaw = 0;
+    this.scanYawMin = 0;
+    this.scanYawMax = 0;
+    this.scanLastYaw = null;
+    this.scanReticle.visible = false;
+  }
+
+  // ----- Tracking hints -----
+
+  /**
+   * Warns before tracking drops, from the two causes seen in device logs:
+   * the camera very close to a surface, and fast turning. Hints appear
+   * after the condition holds for a moment and clear after it has been
+   * gone for about 0.75 s, so they do not flicker.
+   */
+  private updateHints(viewerPose: XRViewerPose, dt: number) {
+    const q = viewerPose.transform.orientation;
+    const quat = new THREE.Quaternion(q.x, q.y, q.z, q.w);
+    const speed = this.hasLastViewQuat && dt > 0 ? this.lastViewQuat.angleTo(quat) / (dt / 1000) : 0;
+    this.lastViewQuat.copy(quat);
+    this.hasLastViewQuat = true;
+
+    const close = this.centreHit !== null && this.centreHit.distance < HINT_CLOSE_M;
+    this.closeFrames = close ? this.closeFrames + 1 : 0;
+    this.fastFrames = speed > HINT_FAST_RAD_S ? this.fastFrames + 1 : 0;
+
+    let next: TrackingHint | null = this.fastFrames > 4 ? 'too-fast' : this.closeFrames > 20 ? 'too-close' : null;
+    if (next === null && this.hint !== null) {
+      this.quietFrames += 1;
+      if (this.quietFrames < 45) next = this.hint;
+    } else {
+      this.quietFrames = 0;
+    }
+    if (next !== this.hint) {
+      this.hint = next;
+      if (next) this.log(`hint shown: ${next}`);
+      this.emit({ type: 'hint', hint: next });
+    }
   }
 
   private countFrame(time: number) {
@@ -704,7 +893,7 @@ export class ArEngine {
 
   /** Creates an object about 1.5 m in front of the user, facing them. */
   spawn(kind: ObjectKind): string | null {
-    if (!this.canEdit) return null;
+    if (!this.canEdit || this.scanning) return null;
     const cam = this.cameraFrame();
     if (!cam) return null;
     const spec = getModelSpec(kind);
@@ -1236,6 +1425,12 @@ export class ArEngine {
     this.hitTestSource?.cancel();
     this.hitTestSource = null;
     this.floorY = null;
+    this.centreHit = null;
+    this.resetScan();
+    this.hint = null;
+    this.scene.environment = null;
+    this.envTexture?.dispose();
+    this.envTexture = null;
     this.hasPose = false;
     this.scene.visible = true;
 

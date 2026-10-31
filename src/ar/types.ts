@@ -1,7 +1,13 @@
 export type TrackingState = 'initializing' | 'tracking' | 'limited' | 'lost';
 
 /** Catalogue entries. More kinds are added in models.ts without touching the engine. */
-export type ObjectKind = 'tv' | 'cube';
+export type ObjectKind = 'tv' | 'chair' | 'table';
+
+/**
+ * Live advice that helps ARCore keep tracking. Shown as a hint, never
+ * enforced: too close to a surface, or turning the device too fast.
+ */
+export type TrackingHint = 'too-close' | 'too-fast';
 
 /** What React needs to know about a placed object. Transforms stay in the engine. */
 export interface ObjectSummary {
@@ -40,6 +46,8 @@ export type EngineEvent =
   | { type: 'visibility'; state: XRVisibilityState }
   | { type: 'fps'; fps: number }
   | { type: 'floor'; known: boolean }
+  | { type: 'scan'; progress: number; done: boolean }
+  | { type: 'hint'; hint: TrackingHint | null }
   | { type: 'objects'; objects: ObjectSummary[]; selectedId: string | null }
   | { type: 'ended'; reason: 'user' | 'browser' }
   | { type: 'error'; error: ArError };

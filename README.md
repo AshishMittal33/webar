@@ -59,11 +59,15 @@ src/
   ar/
     support.ts        WebXR capability detection (no session started)
     types.ts          Tracking state, session info, error mapping
-    ArEngine.ts       WebXR session, renderer, object manager, gestures, undo
-    models.ts         Catalogue of placeholder models (TV, box); GLB later
+    ArEngine.ts       WebXR session, anchors, room scan, tracking hints,
+                      object manager, gestures, undo, debug log
+    models.ts         TV, chair and table built in code (canvas textures)
   components/
     Landing.tsx       Start screen, device check, instructions
-    ArOverlay.tsx     In-session UI: status, catalogue, control pad, gesture layer
+    ArOverlay.tsx     In-session UI: scan panel, catalogue, item controls
+    icons.tsx         Inline SVG icons
+    DebugLogButton.tsx  Copies the session log for bug reports
+    ModelPreview.tsx  Desktop-only model check (?ui=models), not AR
   styles/global.css   Mobile-first styles
 public/models/        GLB assets (added in later phases)
 docs/
@@ -74,7 +78,24 @@ docs/
 ## UI preview without a phone
 
 Open the site with `?ui=preview` to see the in-session overlay UI on a
-desktop. It is clearly labelled and starts no AR session.
+desktop. It is clearly labelled and starts no AR session. Add `&scan=1`
+to watch the room-scan screen fill up. `?ui=models` shows the catalogue
+models in a plain 3D room with the AR lighting, to check how they look.
+
+## Keeping tracking
+
+- **Room scan first.** After Start, the user sweeps the floor and the wall
+  until a progress ring fills (time with good tracking, surface spots seen,
+  and how far the view was swept). ARCore recovers from tracking drops by
+  recognising places it already mapped, so this gives it something to come
+  back to. It can be skipped.
+- **Live hints**, from causes seen in device logs: very close to a surface
+  (under 60 cm at the screen centre) and turning fast. Hints never block.
+- **Anchors are never replaced automatically.** An object whose anchor
+  ARCore stops tracking is hidden, reappears in place when ARCore finds it
+  again, and after 3 s can be brought back in front of the user on request.
+- **Debug log** (details panel, or the start screen after exiting) records
+  tracking drops, ARCore resets, anchor corrections and every edit.
 
 ## How placement works now (and why)
 

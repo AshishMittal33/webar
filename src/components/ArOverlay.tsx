@@ -1,8 +1,34 @@
-import { useEffect, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react';
+import { useEffect, useRef, useState, type PointerEvent as ReactPointerEvent, type ReactNode } from 'react';
 import type { GestureEvent } from '../ar/ArEngine';
-import { CATALOGUE } from '../ar/models';
+import { CATALOGUE, getModelSpec } from '../ar/models';
+import type { ObjectKind, ObjectSummary, SessionInfo, TrackingHint, TrackingState } from '../ar/types';
 import DebugLogButton from './DebugLogButton';
-import type { ObjectKind, ObjectSummary, SessionInfo, TrackingState } from '../ar/types';
+import {
+  AlertIcon,
+  ArrowDownIcon,
+  ArrowLeftIcon,
+  ArrowRightIcon,
+  ArrowUpIcon,
+  ChairIcon,
+  CheckIcon,
+  CloseIcon,
+  CloserIcon,
+  CopyIcon,
+  FaceIcon,
+  FartherIcon,
+  HandIcon,
+  InfoIcon,
+  MinusIcon,
+  PhoneIcon,
+  PlusIcon,
+  RestoreIcon,
+  RotateLeftIcon,
+  RotateRightIcon,
+  TableIcon,
+  TrashIcon,
+  TvIcon,
+  UndoIcon,
+} from './icons';
 
 interface ArOverlayProps {
   tracking: TrackingState;
@@ -11,12 +37,18 @@ interface ArOverlayProps {
   /** Rendered frames per second, updated once a second. 0 until measured. */
   fps: number;
   floorKnown: boolean;
+  /** True until the room scan is complete or skipped. */
+  scanning: boolean;
+  /** Room scan progress, 0 to 1. */
+  scanProgress: number;
+  hint: TrackingHint | null;
   objects: ObjectSummary[];
   selectedId: string | null;
   canUndo: boolean;
   /** When false, touching the screen can select objects but never move them. */
   touchEdit: boolean;
   onTouchEditChange: (enabled: boolean) => void;
+  onSkipScan: () => void;
   onSpawn: (kind: ObjectKind) => void;
   onNudge: (dx: number, dy: number, dz: number) => void;
   onRotate: (degrees: number) => void;
@@ -39,10 +71,21 @@ interface ArOverlayProps {
 }
 
 const TRACKING_LABEL: Record<TrackingState, string> = {
-  initializing: 'Initialising',
+  initializing: 'Starting',
   tracking: 'Tracking',
-  limited: 'Limited',
-  lost: 'Lost',
+  limited: 'Weak tracking',
+  lost: 'Tracking paused',
+};
+
+const HINT_TEXT: Record<TrackingHint, string> = {
+  'too-close': 'Very close to the surface. Step back a little to keep tracking.',
+  'too-fast': 'Moving fast. Turn the tablet more slowly.',
+};
+
+const KIND_ICON: Record<ObjectKind, ReactNode> = {
+  tv: <TvIcon />,
+  chair: <ChairIcon />,
+  table: <TableIcon />,
 };
 
 /** Fraction of screen width at each side where gripping thumbs rest. */
@@ -55,16 +98,61 @@ const STEP_M = 0.05;
 const STEP_DEG = 10;
 const STEP_SCALE = 1.1;
 
-function guidance(tracking: TrackingState, hasObjects: boolean, hasSelection: boolean, touchEdit: boolean): string {
-  if (tracking === 'initializing') return 'Move your phone slowly over the floor to scan the area.';
-  if (tracking === 'lost')
-    return 'Camera tracking paused, objects hidden until it resumes. Aim at something with texture and move slowly.';
-  if (tracking === 'limited') return 'Tracking is weak here. Move slowly; textured surfaces help.';
-  if (!hasObjects) return 'Tap + TV or + Box to add an object in front of you.';
-  if (!hasSelection) return 'Tap an object to select it.';
-  if (touchEdit)
-    return 'Touch move is ON: drag with a finger on the object, add a second finger to pinch, twist or push. Turn it off when done.';
-  return 'Locked: touching the screen will not move it. Use the buttons, or turn Touch move on to drag, pinch and twist.';
+/** A square icon button with a small caption underneath. */
+function Tool({
+  icon,
+  label,
+  onClick,
+  disabled,
+  tone,
+}: {
+  icon: ReactNode;
+  label: string;
+  onClick: () => void;
+  disabled?: boolean;
+  tone?: 'danger' | 'active';
+}) {
+  return (
+    <button className={`tool${tone ? ` ${tone}` : ''}`} onClick={onClick} disabled={disabled} aria-label={label}>
+      {icon}
+      <span>{label}</span>
+    </button>
+  );
+}
+
+function ScanPanel({ progress, tracking, onSkip }: { progress: number; tracking: TrackingState; onSkip: () => void }) {
+  const pct = Math.round(progress * 100);
+  const r = 34;
+  const circumference = 2 * Math.PI * r;
+  return (
+    <section className="scan-panel" aria-live="polite">
+      <div className="scan-visual">
+        <svg viewBox="0 0 80 80" width="92" height="92" className="scan-ring">
+          <circle cx="40" cy="40" r={r} className="track" />
+          <circle
+            cx="40"
+            cy="40"
+            r={r}
+            className="bar"
+            strokeDasharray={circumference}
+            strokeDashoffset={circumference * (1 - progress)}
+          />
+        </svg>
+        <div className="scan-phone">
+          <PhoneIcon width={30} height={30} />
+        </div>
+      </div>
+      <div className="scan-text">
+        <strong>{tracking === 'tracking' ? `Scanning room ${pct}%` : 'Getting ready'}</strong>
+        <span>
+          Move the tablet slowly from side to side. Point at the floor, then at the wall where the TV will go.
+        </span>
+      </div>
+      <button className="link-btn" onClick={onSkip}>
+        Skip
+      </button>
+    </section>
+  );
 }
 
 /**
@@ -72,6 +160,9 @@ function guidance(tracking: TrackingState, hasObjects: boolean, hasSelection: bo
  * The gesture layer covers the whole screen behind the controls and turns
  * pointer events into engine gestures. Everything here calls preventDefault
  * on "beforexrselect" so taps never reach the XR session.
+ *
+ * Performance note: this layer is composited over the camera every frame,
+ * so it uses no backdrop blur and only one small animation (scan phase).
  */
 export default function ArOverlay({
   tracking,
@@ -79,11 +170,15 @@ export default function ArOverlay({
   visibility,
   fps,
   floorKnown,
+  scanning,
+  scanProgress,
+  hint,
   objects,
   selectedId,
   canUndo,
   touchEdit,
   onTouchEditChange,
+  onSkipScan,
   onSpawn,
   onNudge,
   onRotate,
@@ -118,8 +213,8 @@ export default function ArOverlay({
 
   const paused = visibility !== 'visible';
   const selected = objects.find((o) => o.id === selectedId) ?? null;
-  const selectedIndex = selected ? objects.indexOf(selected) + 1 : 0;
   const lostCount = objects.filter((o) => o.lost).length;
+  const canPlace = tracking === 'tracking' && !paused;
 
   // Touches from the hands holding the device: thumbs resting near the left
   // and right edges, or a palm (large contact area). These are dropped so
@@ -143,6 +238,17 @@ export default function ArOverlay({
     onGesture({ type, id: e.pointerId, x: e.clientX / window.innerWidth, y: e.clientY / window.innerHeight });
   };
 
+  const statusClass = paused ? 'limited' : tracking;
+  const statusLabel = paused ? 'Paused' : scanning && tracking === 'tracking' ? 'Scanning' : TRACKING_LABEL[tracking];
+
+  let guide: string | null = null;
+  if (!scanning && !paused && tracking === 'tracking') {
+    if (objects.length === 0) guide = 'Choose an item to place it in front of you.';
+    else if (!selected) guide = 'Tap an item in the room to adjust it.';
+    else if (touchEdit) guide = 'Touch move on: drag the item with one finger, pinch or twist with two.';
+    else guide = 'Item locked to the room. Use the buttons to adjust it.';
+  }
+
   return (
     <div className={`ar-ui${previewMode ? ' preview' : ''}`} ref={uiRef}>
       <div
@@ -156,39 +262,59 @@ export default function ArOverlay({
       {previewMode && <div className="ar-banner">UI preview only. No AR session is running.</div>}
 
       <header className="ar-top">
-        <div className={`ar-status ${tracking}`}>
+        <div className={`pill status ${statusClass}`}>
           <span className="dot" />
-          {paused ? 'Paused' : TRACKING_LABEL[tracking]}
+          {statusLabel}
         </div>
         <div className="ar-top-actions">
-          <button className="ar-icon-btn" aria-label="Session details" onClick={() => setShowInfo((s) => !s)}>
-            i
+          <button
+            className={`round-btn${showInfo ? ' active' : ''}`}
+            aria-label="Session details"
+            onClick={() => setShowInfo((s) => !s)}
+          >
+            <InfoIcon />
           </button>
-          <button className="ar-exit" onClick={onExit}>
-            Exit AR
+          <button className="pill-btn" onClick={onExit}>
+            <CloseIcon width={18} height={18} />
+            Exit
           </button>
         </div>
       </header>
 
+      {hint && !paused && tracking !== 'lost' && (
+        <div className="toast warn" role="status">
+          <AlertIcon width={18} height={18} />
+          {HINT_TEXT[hint]}
+        </div>
+      )}
+
       {showInfo && (
         <section className="ar-panel">
-          <strong>Session details</strong>
+          <div className="panel-head">
+            <strong>Session details</strong>
+            <button className="round-btn small" aria-label="Close details" onClick={() => setShowInfo(false)}>
+              <CloseIcon width={16} height={16} />
+            </button>
+          </div>
           {info ? (
-            <>
-              <div className="hint">Granted: {info.enabledFeatures.join(', ')}</div>
-              <div className="hint">
-                Not granted: {info.missingFeatures.length ? info.missingFeatures.join(', ') : 'none'}
-              </div>
-              <div className="hint">Floor height: {floorKnown ? 'known' : 'not yet (boxes spawn 1.4 m below eye)'}</div>
-              <div className="hint">Objects: {objects.length}</div>
-              <div className="hint">Anchors: {info.anchorsSupported ? 'supported' : 'unavailable'}</div>
-              <div className="hint">Blend mode: {info.environmentBlendMode}</div>
-              <div className="hint">Render rate: {fps ? `${fps} fps` : 'measuring'}</div>
-              <div className="hint">Render scale: {info.renderScale}</div>
-              <div className="hint">
-                Screen: {window.innerWidth}x{window.innerHeight} @ {window.devicePixelRatio}x
-              </div>
-            </>
+            <div className="kv">
+              <span>Features</span>
+              <span>{info.enabledFeatures.join(', ')}</span>
+              <span>Anchors</span>
+              <span>{info.anchorsSupported ? 'supported' : 'unavailable'}</span>
+              <span>Floor</span>
+              <span>{floorKnown ? 'found' : 'not yet'}</span>
+              <span>Objects</span>
+              <span>{objects.length}</span>
+              <span>Frame rate</span>
+              <span>{fps ? `${fps} fps` : 'measuring'}</span>
+              <span>Render scale</span>
+              <span>{info.renderScale}</span>
+              <span>Screen</span>
+              <span>
+                {window.innerWidth}×{window.innerHeight} @ {window.devicePixelRatio}x
+              </span>
+            </div>
           ) : (
             <div className="hint">Waiting for session to start.</div>
           )}
@@ -196,85 +322,132 @@ export default function ArOverlay({
         </section>
       )}
 
-      <footer className="ar-bottom">
-        {lostCount > 0 && !paused && (
-          <section className="ar-lost">
-            <span>
-              {lostCount === 1
-                ? '1 object lost its place when tracking dropped. It comes back by itself if the tablet recognises the room again.'
-                : `${lostCount} objects lost their place when tracking dropped. They come back by themselves if the tablet recognises the room again.`}
-            </span>
-            <button className="ar-chip" disabled={tracking !== 'tracking'} onClick={onRecoverLost}>
-              Bring back here
-            </button>
-          </section>
-        )}
-        <div className="ar-guide">
-          {paused
-            ? 'AR is paused. Return to this tab to continue.'
-            : guidance(tracking, objects.length > 0, !!selected, touchEdit)}
-        </div>
+      {!paused && tracking === 'lost' && !scanning && (
+        <section className="center-card" role="status">
+          <AlertIcon width={30} height={30} />
+          <strong>Tracking paused</strong>
+          <span>Point at the floor or at something with detail and move slowly. Your items come back in place.</span>
+        </section>
+      )}
 
-        {selected ? (
-          <section className="ar-pad">
-            <div className="ar-pad-title">
-              <span>
-                {selected.kind === 'tv' ? 'TV' : 'Box'} {selectedIndex} of {objects.length}
-              </span>
-              <div className="ar-pad-title-actions">
-                <button
-                  className={`ar-chip ${touchEdit ? 'on' : 'off'}`}
-                  aria-pressed={touchEdit}
-                  onClick={() => onTouchEditChange(!touchEdit)}
-                >
-                  Touch move: {touchEdit ? 'ON' : 'OFF'}
+      <footer className="ar-bottom">
+        {paused && <div className="guide">AR is paused. Return to this tab to continue.</div>}
+
+        {!paused && scanning && <ScanPanel progress={scanProgress} tracking={tracking} onSkip={onSkipScan} />}
+
+        {!paused && !scanning && (
+          <>
+            {lostCount > 0 && (
+              <section className="lost-bar">
+                <span>
+                  {lostCount === 1
+                    ? '1 item lost its place when tracking dropped. It returns by itself if the room is recognised again.'
+                    : `${lostCount} items lost their place when tracking dropped. They return by themselves if the room is recognised again.`}
+                </span>
+                <button className="pill-btn light" disabled={!canPlace} onClick={onRecoverLost}>
+                  <RestoreIcon width={18} height={18} />
+                  Bring back here
                 </button>
-                <button className="ar-chip" onClick={onDeselect}>
-                  Done
-                </button>
-              </div>
-            </div>
-            <div className="ar-pad-grid">
-              <button onClick={() => onNudge(-STEP_M, 0, 0)}>◀ Left</button>
-              <button onClick={() => onNudge(0, STEP_M, 0)}>▲ Up</button>
-              <button onClick={() => onNudge(STEP_M, 0, 0)}>Right ▶</button>
-              <button onClick={() => onNudge(0, 0, -STEP_M)}>Closer</button>
-              <button onClick={() => onNudge(0, -STEP_M, 0)}>▼ Down</button>
-              <button onClick={() => onNudge(0, 0, STEP_M)}>Farther</button>
-              <button onClick={() => onRotate(-STEP_DEG)}>⟲ Rotate</button>
-              <button onClick={onFaceUser}>Face me</button>
-              <button onClick={() => onRotate(STEP_DEG)}>Rotate ⟳</button>
-              <button onClick={() => onScale(1 / STEP_SCALE)}>− Size</button>
-              <button onClick={onDuplicate}>Duplicate</button>
-              <button onClick={() => onScale(STEP_SCALE)}>+ Size</button>
-            </div>
-            <div className="ar-pad-row">
-              <button className="ar-danger" onClick={onDelete}>
-                Delete
-              </button>
-              <button disabled={!canUndo} onClick={onUndo}>
-                Undo
-              </button>
-            </div>
-          </section>
-        ) : (
-          <div className="ar-actions">
-            {CATALOGUE.map((m) => (
-              <button key={m.kind} className="ar-place" onClick={() => onSpawn(m.kind)}>
-                + {m.label}
-              </button>
-            ))}
-            {canUndo && (
-              <button className="ar-secondary" onClick={onUndo}>
-                Undo
-              </button>
+              </section>
             )}
-            {objects.length > 0 && (
-              <button className="ar-secondary" onClick={onClear}>
-                Clear
-              </button>
+
+            {guide && <div className="guide">{guide}</div>}
+
+            {selected ? (
+              <section className="sheet" aria-label={`Adjust ${getModelSpec(selected.kind).label}`}>
+                <div className="sheet-head">
+                  <div className="sheet-title">
+                    <span className="kind-badge">{KIND_ICON[selected.kind]}</span>
+                    <div>
+                      <strong>
+                        {getModelSpec(selected.kind).label} {objects.indexOf(selected) + 1}
+                      </strong>
+                      <span>{getModelSpec(selected.kind).detail}</span>
+                    </div>
+                  </div>
+                  <button
+                    className={`pill-btn toggle${touchEdit ? ' on' : ''}`}
+                    aria-pressed={touchEdit}
+                    onClick={() => onTouchEditChange(!touchEdit)}
+                  >
+                    <HandIcon width={18} height={18} />
+                    {touchEdit ? 'Touch move on' : 'Touch move off'}
+                  </button>
+                  <button className="pill-btn primary" onClick={onDeselect}>
+                    <CheckIcon width={18} height={18} />
+                    Done
+                  </button>
+                </div>
+
+                <div className="sheet-groups">
+                  <div className="group">
+                    <span className="group-label">Move</span>
+                    <div className="tools grid-3">
+                      <Tool icon={<ArrowLeftIcon />} label="Left" onClick={() => onNudge(-STEP_M, 0, 0)} />
+                      <Tool icon={<ArrowUpIcon />} label="Up" onClick={() => onNudge(0, STEP_M, 0)} />
+                      <Tool icon={<ArrowRightIcon />} label="Right" onClick={() => onNudge(STEP_M, 0, 0)} />
+                      <Tool icon={<CloserIcon />} label="Closer" onClick={() => onNudge(0, 0, -STEP_M)} />
+                      <Tool icon={<ArrowDownIcon />} label="Down" onClick={() => onNudge(0, -STEP_M, 0)} />
+                      <Tool icon={<FartherIcon />} label="Farther" onClick={() => onNudge(0, 0, STEP_M)} />
+                    </div>
+                  </div>
+                  <div className="group">
+                    <span className="group-label">Turn and size</span>
+                    <div className="tools grid-3">
+                      <Tool icon={<RotateLeftIcon />} label="Turn left" onClick={() => onRotate(STEP_DEG)} />
+                      <Tool icon={<FaceIcon />} label="Face me" onClick={onFaceUser} />
+                      <Tool icon={<RotateRightIcon />} label="Turn right" onClick={() => onRotate(-STEP_DEG)} />
+                      <Tool icon={<MinusIcon />} label="Smaller" onClick={() => onScale(1 / STEP_SCALE)} />
+                      <Tool icon={<CopyIcon />} label="Duplicate" onClick={onDuplicate} />
+                      <Tool icon={<PlusIcon />} label="Bigger" onClick={() => onScale(STEP_SCALE)} />
+                    </div>
+                  </div>
+                </div>
+
+                <div className="sheet-foot">
+                  <button className="pill-btn" disabled={!canUndo} onClick={onUndo}>
+                    <UndoIcon width={18} height={18} />
+                    Undo
+                  </button>
+                  <button className="pill-btn danger" onClick={onDelete}>
+                    <TrashIcon width={18} height={18} />
+                    Delete
+                  </button>
+                </div>
+              </section>
+            ) : (
+              <section className="catalogue" aria-label="Add an item">
+                <div className="catalogue-items">
+                  {CATALOGUE.map((m) => (
+                    <button key={m.kind} className="item-card" disabled={!canPlace} onClick={() => onSpawn(m.kind)}>
+                      <span className="item-icon">{KIND_ICON[m.kind]}</span>
+                      <span className="item-text">
+                        <strong>{m.label}</strong>
+                        <span>{m.detail}</span>
+                      </span>
+                      <span className="item-add">
+                        <PlusIcon width={18} height={18} />
+                      </span>
+                    </button>
+                  ))}
+                </div>
+                {(canUndo || objects.length > 0) && (
+                  <div className="catalogue-foot">
+                    <button className="pill-btn" disabled={!canUndo} onClick={onUndo}>
+                      <UndoIcon width={18} height={18} />
+                      Undo
+                    </button>
+                    {objects.length > 0 && (
+                      <button className="pill-btn danger" onClick={onClear}>
+                        <TrashIcon width={18} height={18} />
+                        Clear all
+                      </button>
+                    )}
+                  </div>
+                )}
+              </section>
             )}
-          </div>
+          </>
         )}
       </footer>
     </div>

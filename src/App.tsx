@@ -7,16 +7,26 @@ import {
   type ObjectKind,
   type ObjectSummary,
   type SessionInfo,
+  type TrackingHint,
   type TrackingState,
 } from './ar/types';
 import ArOverlay from './components/ArOverlay';
 import Landing from './components/Landing';
+import ModelPreview from './components/ModelPreview';
 
 type Screen = 'landing' | 'ar';
 
-const UI_PREVIEW = new URLSearchParams(window.location.search).get('ui') === 'preview';
+const QUERY = new URLSearchParams(window.location.search);
+const UI_PREVIEW = QUERY.get('ui') === 'preview';
+/** ?ui=preview&scan=1 shows the scanning screen filling up, for desktop checks. */
+const PREVIEW_SCAN = UI_PREVIEW && QUERY.get('scan') === '1';
 
 export default function App() {
+  if (QUERY.get('ui') === 'models') return <ModelPreview />;
+  return <ArApp />;
+}
+
+function ArApp() {
   const engineRef = useRef<ArEngine | null>(null);
   if (!engineRef.current) engineRef.current = new ArEngine();
   const engine = engineRef.current;
@@ -32,6 +42,9 @@ export default function App() {
   const [visibility, setVisibility] = useState<XRVisibilityState>('visible');
   const [fps, setFps] = useState(0);
   const [floorKnown, setFloorKnown] = useState(false);
+  const [scanning, setScanning] = useState(!UI_PREVIEW || PREVIEW_SCAN);
+  const [scanProgress, setScanProgress] = useState(0);
+  const [hint, setHint] = useState<TrackingHint | null>(null);
   const [objects, setObjects] = useState<ObjectSummary[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [canUndo, setCanUndo] = useState(false);
@@ -49,6 +62,16 @@ export default function App() {
           setTracking('initializing');
           setVisibility('visible');
           setFloorKnown(false);
+          setScanning(true);
+          setScanProgress(0);
+          setHint(null);
+          break;
+        case 'scan':
+          setScanProgress(e.progress);
+          setScanning(!e.done);
+          break;
+        case 'hint':
+          setHint(e.hint);
           break;
         case 'tracking':
           setTracking(e.state);
@@ -116,6 +139,30 @@ export default function App() {
   };
 
   const handleStatsToggle = useCallback((open: boolean) => engine.setStatsEnabled(open), [engine]);
+
+  // Preview only: fill the scan ring over a few seconds, then finish.
+  useEffect(() => {
+    if (!PREVIEW_SCAN) return;
+    const timer = window.setInterval(() => {
+      setScanProgress((p) => {
+        const next = Math.min(1, p + 0.05);
+        if (next >= 1) {
+          window.clearInterval(timer);
+          setScanning(false);
+        }
+        return next;
+      });
+    }, 250);
+    return () => window.clearInterval(timer);
+  }, []);
+
+  const handleSkipScan = () => {
+    if (UI_PREVIEW) {
+      setScanning(false);
+      return;
+    }
+    engine.skipScan();
+  };
 
   // In UI preview mode there is no engine session; fake a small object list
   // so the control pad can be looked at on a desktop.
@@ -199,6 +246,10 @@ export default function App() {
             visibility={visibility}
             fps={fps}
             floorKnown={floorKnown}
+            scanning={scanning}
+            scanProgress={scanProgress}
+            hint={hint}
+            onSkipScan={handleSkipScan}
             objects={objects}
             selectedId={selectedId}
             canUndo={canUndo}
