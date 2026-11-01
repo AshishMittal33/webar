@@ -14,7 +14,7 @@ app, no paid SDKs, no backend.
 | 4 | Wall placement investigation: hit-test, depth, two-point wall line | Investigated; superseded, see limitations |
 | 5 | Multi-object manager, spawn in front of user, drag/pinch/twist + button controls, undo | Built, awaiting phone test |
 | 6 | Catalogue, error handling, performance, JSON export/import | Pending |
-| 7 | Free HTTPS deployment and QR code | Pending |
+| 7 | Free HTTPS deployment (GitHub Pages, auto on push) | Done |
 
 ## Requirements
 
@@ -128,3 +128,17 @@ spawn on the floor. TVs spawn at eye height facing the user.
 - Exported JSON stores virtual coordinates relative to the AR session origin.
   Re-importing in a new session does not restore objects to the same
   real-world spot without persistent anchors.
+
+## Deployment
+
+Every push to `main` builds the app and publishes it to GitHub Pages
+(`.github/workflows/deploy.yml`). The live site is
+https://ashishmittal33.github.io/webar/.
+
+One-time setup: on GitHub open the repository's **Settings → Pages** and set
+**Source** to **GitHub Actions**. After that, deploying a change is just
+`git push`. Progress is shown in the repository's **Actions** tab.
+
+AR needs Chrome on an Android device with Google Play Services for AR.
+Other browsers (including iPhone and iPad Safari) open the page but cannot
+start AR, because they do not support WebXR AR.

@@ -4,9 +4,11 @@ import basicSsl from '@vitejs/plugin-basic-ssl';
 
 // HTTPS is required for WebXR. The dev server serves a self-signed
 // certificate so an Android phone on the same Wi-Fi can open it.
-// Production (Cloudflare Pages) provides real HTTPS; nothing here is
-// tied to localhost.
+// Production (GitHub Pages) provides real HTTPS; nothing here is tied to
+// localhost. Relative asset paths let the build run from any folder, such
+// as https://<user>.github.io/webar/.
 export default defineConfig({
+  base: './',
   plugins: [react(), basicSsl()],
   server: {
     host: true,
